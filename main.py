@@ -93,7 +93,9 @@ class LivingMemoryPlugin(Star):
                 self.faiss_manager,
             )
             self.forgetting_agent = ForgettingAgent(
-                self.context, self.config.get("forgetting_agent", {}), self.faiss_manager
+                self.context,
+                self.config.get("forgetting_agent", {}),
+                self.faiss_manager,
             )
 
             # 4. 启动后台任务
@@ -312,7 +314,7 @@ class LivingMemoryPlugin(Star):
 
             card = (
                 f"---\n"
-                f"ID: {res.id}\n"
+                f"ID: {res.data['id']}\n"
                 f"Created At: {create_time_str}\n"
                 f"Content: {res.data['text']}\n"
                 f"Score: {res.similarity:.2f}"

@@ -112,8 +112,8 @@ class FaissManager:
 
         if results:
             # 更新被访问记忆的 last_access_time
-            # FaissVecDB 返回的 Result.id 就是我们需要的整数 ID
-            accessed_ids = [res.id for res in results]
+            # FaissVecDB 返回的 Result.data['id'] 才是我们需要的整数 ID
+            accessed_ids = [res.data["id"] for res in results]
             await self.update_memory_access_time(accessed_ids)
 
         return results

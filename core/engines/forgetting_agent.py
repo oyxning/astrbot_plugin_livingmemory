@@ -8,7 +8,8 @@ import asyncio
 import json
 from typing import Dict, Any, Optional
 
-from astrbot.api import logger, Context
+from astrbot.api import logger
+from astrbot.api.star import Context
 from ...storage.faiss_manager import FaissManager
 from ..utils import get_now_datetime
 

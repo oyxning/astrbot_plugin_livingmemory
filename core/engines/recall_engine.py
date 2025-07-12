@@ -8,7 +8,8 @@ import json
 import math
 from typing import List, Dict, Any, Optional
 
-from astrbot.api import logger, Context
+from astrbot.api import logger
+from astrbot.api.star import Context
 from ...storage.faiss_manager import FaissManager, Result
 from ..utils import get_now_datetime
 
@@ -114,10 +115,9 @@ class RecallEngine:
                 + recency_score * rec_w
             )
 
-            # 注意：原始的 similarity 分数被替换为我们的加权分数
-            reranked_results.append(
-                Result(id=res.id, similarity=final_score, data=res.data)
-            )
+            # 直接修改现有 Result 对象的 similarity 分数
+            res.similarity = final_score
+            reranked_results.append(res)
 
         # 按最终得分降序排序
         reranked_results.sort(key=lambda x: x.similarity, reverse=True)
