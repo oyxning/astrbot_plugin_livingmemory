@@ -1,73 +1,109 @@
-# LivingMemory - 活的记忆
+# LivingMemory - 动态生命周期记忆插件
 
-`LivingMemory` 是一个为 AstrBot 设计的、拥有完整记忆生命周期管理的智能长期记忆插件。
+<p align="center">
+  <span style="font-size: 5rem;">🧠</span>
+</p>
 
-与依赖大型数据库的传统记忆插件不同，`LivingMemory` 使用轻量级的 `Faiss` 和 `SQLite` 作为存储后端，实现了低资源消耗和零配置部署。
+<p align="center">
+  <i>为 AstrBot 打造的、拥有完整记忆生命周期的智能长期记忆插件。</i>
+  <br><br>
+  <!-- 技术徽章 -->
+  <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/Faiss-CPU-orange.svg" alt="Faiss">
+  <img src="https://img.shields.io/github/license/lxfight/astrbot_plugin_livingmemory?style=flat-square&color=green" alt="License">
+  <!-- GitHub 统计 -->
+  <a href="https://github.com/lxfight/astrbot_plugin_livingmemory">
+    <img src="https://img.shields.io/github/stars/lxfight/astrbot_plugin_livingmemory?style=social" alt="GitHub Stars">
+  </a>
+  <!-- 访客计数器 -->
+  <img src="https://komarev.com/ghpvc/?username=lxfight&repo=astrbot_plugin_livingmemory&color=blueviolet" alt="Visitor Count">
+</p>
 
-## ✨ 核心特性
+<p align="center">
+  <a href="https://github.com/anuraghazra/github-readme-stats">
+    <img align="center" src="https://github-readme-stats.vercel.app/api?username=lxfight&show_icons=true&theme=radical&rank_icon=github" />
+  </a>
+  <a href="https://github.com/anuraghazra/github-readme-stats">
+    <img align="center" src="https://github-readme-stats.vercel.app/api/top-langs/?username=lxfight&layout=compact&theme=radical" />
+  </a>
+</p>
 
-本插件的核心是 **动态记忆生命周期 (Dynamic Memory Lifecycle)** 模型，由三大引擎协同工作：
+---
 
-1.  🧠 **反思引擎 (Reflection Engine)**
-    *   **智能总结**: 在对话进行到一定阶段时，自动将零散的对话历史总结成结构化的、有意义的记忆条目。
-    *   **重要性评估**: 利用 LLM 对生成的每条记忆进行重要性打分，确保只有高质量、高价值的信息才会被长期保存。
+`LivingMemory` 告别了传统记忆插件对大型数据库的依赖，创新性地采用轻量级的 `Faiss` 和 `SQLite` 作为存储后端。这不仅实现了 **零配置部署** 和 **极低的资源消耗**，更引入了革命性的 **动态记忆生命周期 (Dynamic Memory Lifecycle)** 模型。
 
-2.  🔍 **回忆引擎 (Recall Engine)**
-    *   **多策略召回**: 不再是简单的文本相似度匹配。回忆引擎会综合考虑记忆的 **相关性**、**重要性** 和 **新近度**，通过加权算法计算出最符合当前上下文的记忆。
-    *   **动态更新**: 每次记忆被成功召回，它的“新近度”就会被刷新，使其在短期内更容易被再次访问，模拟了人类的短期记忆强化效应。
+## ✨ 核心特性：动态记忆生命周期
 
-3.  🗑️ **遗忘代理 (Forgetting Agent)**
-    *   **模拟遗忘曲线**: 作为一个后台任务，遗忘代理会定期运行，模拟人类的遗忘过程。
-    *   **价值衰减**: 记忆的重要性会随着时间的推移而自然衰减。
-    *   **自动修剪**: 那些长时间未被访问、且重要性已衰减到阈值以下的陈旧记忆，将被自动清理，从而防止信息过载，保持记忆库的高效和健康。
+本插件通过三大智能引擎的协同工作，完美模拟了人类记忆的形成、巩固、联想和遗忘的全过程。
 
-## 🚀 安装
+| 引擎 | 图标 | 核心功能 | 描述 |
+| :--- | :---: | :--- | :--- |
+| **反思引擎** | 🧠 | `智能总结` & `重要性评估` | 在对话中自动提炼关键信息，形成结构化记忆，并利用 LLM 评估其重要性，确保高价值信息得以保留。 |
+| **回忆引擎** | 🔍 | `多策略召回` & `动态刷新` | 综合考虑记忆的 **相关性**、**重要性** 和 **新近度**，精准召回最匹配的记忆。每次成功回忆都会强化该记忆，模拟人类的记忆强化效应。 |
+| **遗忘代理** | 🗑️ | `模拟遗忘曲线` & `自动修剪` | 作为后台任务，它会模拟艾宾浩斯遗忘曲线，让记忆的重要性随时间自然衰减，并自动清理那些陈旧且价值低的记忆，保持记忆库的健康与高效。 |
 
-1.  将 `astrbot_plugin_livingmemory` 文件夹放置于 AstrBot 的 `data/plugins` 目录下。
-2.  AstrBot 会自动检测 `requirements.txt` 并安装所需依赖。请确保您的环境可以编译 `faiss-cpu`。
+## 🚀 快速开始
 
-    ```
-    faiss-cpu
-    ```
+### 1. 安装
 
-## ⚙️ 配置
+将 `astrbot_plugin_livingmemory` 文件夹放置于 AstrBot 的 `data/plugins` 目录下。AstrBot 将自动检测并安装 `requirements.txt` 中声明的依赖。
 
-插件的详细配置可以在 AstrBot 的 WebUI -> 插件管理 -> LivingMemory 中找到。所有配置项都有详细的中文说明。
+**依赖项:**
+```
+faiss-cpu
+```
+> **注意**: 请确保您的系统环境支持 `faiss-cpu` 的编译和安装。
 
-### Provider 设置
-- **Embedding Provider ID**: 用于生成向量的 Embedding Provider。如果留空，插件将自动尝试使用第一个加载的向量服务。
-- **LLM Provider ID**: 用于总结和评估记忆的 LLM Provider。如果留空，将使用 AstrBot 的默认 LLM 服务。
+### 2. 配置
 
-### 回忆引擎 (Recall Engine)
+所有详细配置均可在 **AstrBot WebUI -> 插件管理 -> LivingMemory** 中进行调整。每个配置项都提供了清晰的中文说明，方便您快速上手。
+
+<details>
+<summary><strong>⚙️ 点击展开详细配置说明</strong></summary>
+
+#### Provider 设置
+- **Embedding Provider ID**: 用于生成向量的 Embedding Provider。留空则自动使用第一个加载的向量服务。
+- **LLM Provider ID**: 用于总结和评估记忆的 LLM Provider。留空则使用 AstrBot 的默认 LLM 服务。
+
+#### 回忆引擎 (Recall Engine)
 - **top_k**: 单次检索返回的记忆数量。
-- **recall_strategy**: 召回策略。`similarity` 仅基于相似度，`weighted` 会综合考虑相似度、重要性和新近度。
-- **权重配置**: 当使用 `weighted` 策略时，可以调整三者的权重。
+- **recall_strategy**: 召回策略。`similarity` (仅相似度) 或 `weighted` (综合加权)。
+- **权重配置**: 当使用 `weighted` 策略时，可自由调整 **相似度**、**重要性** 和 **新近度** 的权重。
 
-### 过滤设置 (Filtering Settings)
-- **use_persona_filtering**: 是否启用人格记忆过滤。开启后，只会召回和总结与当前人格相关的记忆。
-- **use_session_filtering**: 是否启用会话记忆隔离。开启后，每个会话的记忆将是独立的。
+#### 过滤设置 (Filtering Settings)
+- **use_persona_filtering**: 开启后，只会召回和总结与当前人格相关的记忆。
+- **use_session_filtering**: 开启后，每个会话的记忆将是独立的。
 
-### 反思引擎 (Reflection Engine)
-- **summary_trigger_rounds**: 触发对话历史总结的对话轮次（一问一答为一轮）。
-- **importance_threshold**: 记忆重要性得分的最低阈值，低于此值的记忆将被忽略。
+#### 反思引擎 (Reflection Engine)
+- **summary_trigger_rounds**: 触发对话历史总结的对话轮次。
+- **importance_threshold**: 记忆重要性得分的最低阈值。
 - **summary_prompt / evaluation_prompt**: 可自定义用于指导 LLM 进行总结和评估的提示。
 
-### 遗忘代理 (Forgetting Agent)
+#### 遗忘代理 (Forgetting Agent)
 - **enabled**: 是否启用自动遗忘。
-- **check_interval_hours**: 遗忘代理的运行周期。
+- **check_interval_hours**: 遗忘代理的运行周期（小时）。
 - **retention_days**: 记忆的最长无条件保留天数。
 - **importance_decay_rate**: 重要性得分的每日衰减率。
 
-## 🛠️ 使用方法
+</details>
 
-插件通过后台事件钩子自动工作，无需用户干预。同时，也为管理员提供了以下命令来管理记忆库：
+## 🛠️ 管理命令
 
--   `/lmem status`
-    -   查看当前记忆库的状态，如总记忆数。
--   `/lmem search <query> [k=3]`
-    -   手动搜索与 `<query>` 相关的记忆。
--   `/lmem forget <doc_id>`
-    -   强制删除一条指定 ID 的记忆。
--   `/lmem run_forgetting_agent`
-    -   手动触发一次遗忘代理的清理任务。
+插件在后台自动运行，无需用户干预。同时，也为管理员提供了以下命令来便捷地管理记忆库：
 
+| 命令 | 参数 | 描述 |
+| :--- | :--- | :--- |
+| `/lmem status` | - | 查看当前记忆库的状态，如总记忆数。 |
+| `/lmem search` | `<query> [k=3]` | 手动搜索与 `<query>` 相关的记忆。 |
+| `/lmem forget` | `<doc_id>` | 强制删除一条指定 ID 的记忆。 |
+| `/lmem run_forgetting_agent` | - | 手动触发一次遗忘代理的清理任务。 |
+
+---
+
+## 🤝 贡献
+
+欢迎各种形式的贡献，包括提交问题 (Issues)、请求新功能 (Feature Requests) 和代码贡献 (Pull Requests)。
+
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE) 开源。
