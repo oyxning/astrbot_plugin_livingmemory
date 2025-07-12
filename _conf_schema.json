@@ -1,0 +1,138 @@
+{
+  "provider_settings": {
+    "description": "模型提供商设置",
+    "type": "object",
+    "items": {
+      "embedding_provider_id": {
+        "description": "Embedding Provider ID",
+        "hint": "(必填)用于生成向量的 Embedding Provider ID。",
+        "type": "string",
+        "default": ""
+      },
+      "llm_provider_id": {
+        "description": "LLM Provider ID",
+        "hint": "用于总结和评估记忆的 LLM Provider ID。如果留空，将使用 AstrBot 的默认 LLM Provider。",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "recall_engine": {
+    "description": "回忆引擎设置",
+    "hint": "负责智能检索记忆",
+    "type": "object",
+    "items": {
+      "top_k": {
+        "description": "单次检索数量",
+        "hint": "单次检索返回的最相关记忆数量。",
+        "type": "int",
+        "default": 5
+      },
+      "recall_strategy": {
+        "description": "召回策略",
+        "hint": "'similarity' - 仅基于相似度；'weighted' - 综合加权。",
+        "type": "string",
+        "options": ["similarity", "weighted"],
+        "default": "weighted"
+      },
+      "similarity_weight": {
+        "description": "相关性权重",
+        "hint": "范围 (0.0 - 1.0)",
+        "type": "float",
+        "default": 0.6
+      },
+      "recency_weight": {
+        "description": "新近度权重",
+        "hint": "范围 (0.0 - 1.0)",
+        "type": "float",
+        "default": 0.2
+      },
+      "importance_weight": {
+        "description": "重要性权重",
+        "hint": "范围 (0.0 - 1.0)",
+        "type": "float",
+        "default": 0.2
+      }
+    }
+  },
+  "filtering_settings": {
+    "description": "过滤与隔离设置",
+    "type": "object",
+    "items": {
+      "use_persona_filtering": {
+        "description": "启用人格记忆过滤",
+        "hint": "开启后，只会召回和总结与当前人格相关的记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "use_session_filtering": {
+        "description": "启用会话记忆隔离",
+        "hint": "开启后，每个会话的记忆将是独立的。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "reflection_engine": {
+    "description": "反思引擎设置",
+    "hint": "负责生成和评估记忆",
+    "type": "object",
+    "items": {
+      "summary_trigger_rounds": {
+        "description": "总结触发轮次",
+        "hint": "触发对话历史总结的对话轮次（一问一答为一轮）。",
+        "type": "int",
+        "default": 5
+      },
+      "importance_threshold": {
+        "description": "重要性阈值",
+        "hint": "记忆重要性得分的最低阈值，低于此值的记忆将被忽略。",
+        "type": "float",
+        "default": 0.5
+      },
+      "summary_prompt": {
+        "description": "总结提示词",
+        "hint": "指导 LLM 进行对话总结的 System Prompt。",
+        "type": "text",
+        "default": "请将以下多轮对话历史总结为一段简洁、客观、包含关键信息的长期记忆条目。请使用第三人称视角，并专注于主要人物信息、事实和关键决策。"
+      },
+      "evaluation_prompt": {
+        "description": "评估提示词",
+        "hint": "指导 LLM 评估记忆重要性的 System Prompt。必须返回一个 0.0 到 1.0 之间的浮点数。",
+        "type": "text",
+        "default": "请评估以下记忆条目的重要性，对于未来的对话有多大的参考价值？请给出一个 0.0 到 1.0 之间的分数，其中 1.0 代表极其重要，0.0 代表毫无价值。请只返回数字，不要包含任何其他文本。\n\n记忆内容：\n{memory_content}"
+      }
+    }
+  },
+  "forgetting_agent": {
+    "description": "遗忘代理设置",
+    "hint": "负责模拟遗忘，清理陈旧记忆",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用自动遗忘",
+        "hint": "是否启用自动遗忘机制。",
+        "type": "bool",
+        "default": true
+      },
+      "check_interval_hours": {
+        "description": "检查间隔(小时)",
+        "hint": "遗忘代理每隔多少小时运行一次。",
+        "type": "int",
+        "default": 24
+      },
+      "retention_days": {
+        "description": "记忆保留天数",
+        "hint": "记忆无条件保留的最长天数。超过此天数的记忆将可能被遗忘。",
+        "type": "int",
+        "default": 90
+      },
+      "importance_decay_rate": {
+        "description": "重要性衰减率",
+        "hint": "重要性得分每天衰减的速率。例如 0.01 代表每天降低 1%。",
+        "type": "float",
+        "default": 0.005
+      }
+    }
+  }
+}

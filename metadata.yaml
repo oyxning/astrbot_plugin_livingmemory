@@ -1,0 +1,6 @@
+name: LivingMemory
+id: astrbot_plugin_livingmemory
+author: lxfight
+version: 1.0.0
+description: 一个拥有动态生命周期的智能长期记忆插件。
+repo: https://github.com/lxfight/astrbot_plugin_livingmemory
