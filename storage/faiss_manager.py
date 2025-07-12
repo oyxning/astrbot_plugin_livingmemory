@@ -54,10 +54,21 @@ class FaissManager:
             metadata.setdefault("importance", importance)
             metadata.setdefault("session_id", session_id)
             metadata.setdefault("persona_id", persona_id)
-            metadata.setdefault("last_access_time", metadata.get("timestamp"))
+
+            # 时间戳现在应该是 datetime 对象，直接转换为 float
+            ts_obj = metadata.get("timestamp")
+            if ts_obj and hasattr(ts_obj, "timestamp"):
+                timestamp_float = ts_obj.timestamp()
+                metadata["create_time"] = timestamp_float
+                metadata["last_access_time"] = timestamp_float
+            else:
+                # 后备方案
+                current_timestamp = time.time()
+                metadata.setdefault("create_time", current_timestamp)
+                metadata.setdefault("last_access_time", current_timestamp)
         else:
             # 兼容旧的或简单的调用方式
-            current_timestamp = int(time.time())
+            current_timestamp = time.time()
             metadata = {
                 "importance": importance,
                 "create_time": current_timestamp,
@@ -101,7 +112,8 @@ class FaissManager:
 
         if results:
             # 更新被访问记忆的 last_access_time
-            accessed_ids = [res.data["id"] for res in results]
+            # FaissVecDB 返回的 Result.id 就是我们需要的整数 ID
+            accessed_ids = [res.id for res in results]
             await self.update_memory_access_time(accessed_ids)
 
         return results
@@ -116,7 +128,7 @@ class FaissManager:
         if not doc_ids:
             return
 
-        current_timestamp = int(time.time())
+        current_timestamp = time.time()
 
         # 从数据库中获取现有的元数据
         docs = await self.db.document_storage.get_documents(

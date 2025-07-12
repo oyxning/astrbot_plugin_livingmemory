@@ -6,6 +6,8 @@ main.py - LivingMemory 插件主文件
 
 import asyncio
 import os
+import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 # AstrBot API
@@ -24,8 +26,10 @@ from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 
 # 插件内部模块
 from .storage.faiss_manager import FaissManager
-from .core.logic import RecallEngine, ReflectionEngine, ForgettingAgent
-from .core.utils import get_persona_id, format_memories_for_injection
+from .core.engines.recall_engine import RecallEngine
+from .core.engines.reflection_engine import ReflectionEngine
+from .core.engines.forgetting_agent import ForgettingAgent
+from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime
 
 # 简易会话管理器，用于跟踪对话历史和轮次
 # key: session_id, value: {"history": [], "round_count": 0}
@@ -89,7 +93,7 @@ class LivingMemoryPlugin(Star):
                 self.faiss_manager,
             )
             self.forgetting_agent = ForgettingAgent(
-                self.config.get("forgetting_agent", {}), self.faiss_manager
+                self.context, self.config.get("forgetting_agent", {}), self.faiss_manager
             )
 
             # 4. 启动后台任务
@@ -163,7 +167,7 @@ class LivingMemoryPlugin(Star):
 
             # 使用 RecallEngine 进行智能回忆
             recalled_memories = await self.recall_engine.recall(
-                req.prompt, recall_session_id, recall_persona_id
+                self.context, req.prompt, recall_session_id, recall_persona_id
             )
 
             if recalled_memories:
@@ -281,21 +285,47 @@ class LivingMemoryPlugin(Star):
             yield event.plain_result("回忆引擎尚未初始化。")
             return
 
-        results = await self.recall_engine.recall(query, k=k)
+        results = await self.recall_engine.recall(self.context, query, k=k)
         if not results:
             yield event.plain_result(f"未能找到与 '{query}' 相关的记忆。")
             return
 
-        response = f"与 '{query}' 最相关的 {len(results)} 条记忆：\n"
-        for i, res in enumerate(results):
-            response += f"{i + 1}. ID: {res.data['id']}, 最终得分: {res.similarity:.4f}\n   内容: {res.data['text']}\n"
+        response_parts = [f"Found {len(results)} memories:"]
+        tz = get_now_datetime(self.context).tzinfo  # 获取当前时区
 
+        for res in results:
+            metadata = res.data.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    metadata = {}
+
+            create_time_ts = metadata.get("create_time", 0)
+            try:
+                # 从时间戳创建 UTC datetime 对象，然后转换为本地时区
+                dt_utc = datetime.fromtimestamp(create_time_ts, tz=timezone.utc)
+                dt_local = dt_utc.astimezone(tz)
+                create_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except (ValueError, TypeError):
+                create_time_str = "未知"
+
+            card = (
+                f"---\n"
+                f"ID: {res.id}\n"
+                f"Created At: {create_time_str}\n"
+                f"Content: {res.data['text']}\n"
+                f"Score: {res.similarity:.2f}"
+            )
+            response_parts.append(card)
+
+        response = "\n".join(response_parts) + "\n---"
         yield event.plain_result(response)
 
     @permission_type(PermissionType.ADMIN)
     @lmem_group.command("forget")
     async def lmem_forget(self, event: AstrMessageEvent, doc_id: int):
-        """[管理员] 强制删除一条指定 ID 的记忆。"""
+        """[管理员] 强制删除一条指定整数 ID 的记忆。"""
         if not self.faiss_manager:
             yield event.plain_result("记忆库尚未初始化。")
             return
@@ -304,7 +334,7 @@ class LivingMemoryPlugin(Star):
             await self.faiss_manager.delete_memories([doc_id])
             yield event.plain_result(f"已成功删除 ID 为 {doc_id} 的记忆。")
         except Exception as e:
-            yield event.plain_result(f"删除记忆失败: {e}")
+            yield event.plain_result(f"删除记忆时发生错误: {e}")
 
     @permission_type(PermissionType.ADMIN)
     @lmem_group.command("run_forgetting_agent")

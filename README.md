@@ -64,6 +64,7 @@ faiss-cpu
 #### Provider 设置
 - **Embedding Provider ID**: 用于生成向量的 Embedding Provider。留空则自动使用第一个加载的向量服务。
 - **LLM Provider ID**: 用于总结和评估记忆的 LLM Provider。留空则使用 AstrBot 的默认 LLM 服务。
+- **Timezone**: 用于解析和显示时间的时区。默认为 `Asia/Shanghai`。
 
 #### 回忆引擎 (Recall Engine)
 - **top_k**: 单次检索返回的记忆数量。
@@ -91,12 +92,41 @@ faiss-cpu
 
 插件在后台自动运行，无需用户干预。同时，也为管理员提供了以下命令来便捷地管理记忆库：
 
+> **数据模型变更**: 请注意，从最新版本开始，记忆的唯一标识符（ID）已从 UUID 更改为自增整数。这简化了管理操作。
+
 | 命令 | 参数 | 描述 |
 | :--- | :--- | :--- |
 | `/lmem status` | - | 查看当前记忆库的状态，如总记忆数。 |
-| `/lmem search` | `<query> [k=3]` | 手动搜索与 `<query>` 相关的记忆。 |
-| `/lmem forget` | `<doc_id>` | 强制删除一条指定 ID 的记忆。 |
+| `/lmem search` | `<query> [k=3]` | 手动搜索与 `<query>` 相关的记忆，并以卡片形式展示结果。 |
+| `/lmem forget` | `<memory_id>` | 强制删除一条指定整数 ID 的记忆。 |
 | `/lmem run_forgetting_agent` | - | 手动触发一次遗忘代理的清理任务。 |
+
+<details>
+<summary><strong>💡 点击展开 `lmem search` 输出示例</strong></summary>
+
+```
+[LivingMemory] 搜索到 3 条相关记忆:
+---
+[Card]
+ID: 101
+Created: 2023-10-27 10:30:00 (Asia/Shanghai)
+Content: 用户表示对自然语言处理技术很感兴趣。
+Score: 0.89
+---
+[Card]
+ID: 102
+Created: 2023-10-27 11:00:00 (Asia/Shanghai)
+Content: 用户询问了关于 Transformer 模型的细节。
+Score: 0.85
+---
+[Card]
+ID: 105
+Created: 2023-10-28 14:15:00 (Asia/Shanghai)
+Content: 用户最近在学习 PyTorch 框架。
+Score: 0.78
+```
+
+</details>
 
 ---
 

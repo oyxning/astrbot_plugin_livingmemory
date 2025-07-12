@@ -3,8 +3,12 @@
 utils.py - 插件的辅助工具函数
 """
 
+import re
 import json
+from datetime import datetime
 from typing import List, Optional
+
+import pytz
 
 from astrbot.api.star import Context
 from astrbot.api.event import AstrMessageEvent
@@ -35,6 +39,35 @@ async def get_persona_id(context: Context, event: AstrMessageEvent) -> Optional[
     except Exception:
         # 在某些情况下（如无会话），获取可能会失败，返回 None
         return None
+
+
+def extract_json_from_response(text: str) -> str:
+    """
+    从可能包含 Markdown 代码块的文本中提取纯 JSON 字符串。
+    """
+    # 查找被 ```json ... ``` 或 ``` ... ``` 包围的内容
+    match = re.search(r"```(json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        # 返回捕获组中的 JSON 部分
+        return match.group(2)
+
+    # 如果没有找到代码块，假设整个文本就是 JSON（可能需要去除首尾空格）
+    return text.strip()
+
+
+def get_now_datetime(context: Context) -> datetime:
+    """
+    获取当前时间，并根据插件配置设置时区。
+    """
+    try:
+        # 尝试从配置中获取时区
+        tz_str = context.plugin_config.get("timezone_settings.timezone", "Asia/Shanghai")
+        timezone = pytz.timezone(tz_str)
+    except (pytz.UnknownTimeZoneError, AttributeError):
+        # 如果配置不存在或时区无效，则使用默认值
+        timezone = pytz.timezone("Asia/Shanghai")
+
+    return datetime.now(timezone)
 
 
 def format_memories_for_injection(memories: List[Result]) -> str:

@@ -1,11 +1,23 @@
 {
+  "timezone_settings": {
+    "description": "时区设置",
+    "type": "object",
+    "items": {
+      "timezone": {
+        "description": "时区",
+        "hint": "用于生成带时区信息的时间对象，请使用 IANA 时区数据库名称，例如 'Asia/Shanghai', 'America/New_York'。",
+        "type": "string",
+        "default": "Asia/Shanghai"
+      }
+    }
+  },
   "provider_settings": {
     "description": "模型提供商设置",
     "type": "object",
     "items": {
       "embedding_provider_id": {
         "description": "Embedding Provider ID",
-        "hint": "(必填)用于生成向量的 Embedding Provider ID。",
+        "hint": "用于生成向量的 Embedding Provider ID。如果留空，将使用 AstrBot 的默认 Embedding Provider。",
         "type": "string",
         "default": ""
       },
@@ -32,7 +44,10 @@
         "description": "召回策略",
         "hint": "'similarity' - 仅基于相似度；'weighted' - 综合加权。",
         "type": "string",
-        "options": ["similarity", "weighted"],
+        "options": [
+          "similarity",
+          "weighted"
+        ],
         "default": "weighted"
       },
       "similarity_weight": {
@@ -92,9 +107,15 @@
       },
       "event_extraction_prompt": {
         "description": "事件提取提示词",
-        "hint": "指导 LLM 从对话历史中提取多个结构化记忆事件的 System Prompt。模型需要根据此提示返回一个包含事件列表的 JSON 对象。",
+        "hint": "指导 LLM 从对话历史中提取多个结构化记忆事件的 System Prompt。",
         "type": "text",
-        "default": "你是一个善于分析和总结的AI助手。你的任务是仔细阅读一段对话历史，并从中提取出多个独立的、有意义的记忆事件。\n这些事件可以是关于事实、用户的偏好、目标、观点或你们之间关系的变化。\n\n你需要为每个提取的事件评估一个重要性分数（0.0到1.0之间），分数越高代表该记忆越关键、越长久。\n\n请严格按照下面提供的 JSON 格式返回你的分析结果，不要添加任何额外的解释或文字。"
+        "default": "你是一个善于分析和总结的AI助手。你的任务是仔细阅读一段对话历史，并从中提取出多个独立的、有意义的记忆事件。这些事件可以是关于事实、用户的偏好、目标、观点或你们之间关系的变化。请严格按照指定的 JSON 格式返回你的分析结果，不要包含任何评分信息，也不要添加任何额外的解释或文字。"
+      },
+      "evaluation_prompt": {
+        "description": "评估提示词",
+        "hint": "指导 LLM 评估单个记忆事件重要性的 System Prompt。必须返回一个 0.0 到 1.0 之间的浮点数。",
+        "type": "text",
+        "default": "请评估以下记忆条目的重要性，对于未来的对话有多大的参考价值？请给出一个 0.0 到 1.0 之间的分数，其中 1.0 代表极其重要，0.0 代表毫无价值。请只返回数字，不要包含任何其他文本。\n\n记忆内容：\n{memory_content}"
       }
     }
   },
