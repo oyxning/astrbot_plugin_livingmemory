@@ -8,16 +8,86 @@ import asyncio
 import time
 import math
 import json
+import uuid
+from datetime import datetime, timezone
+from enum import Enum
 from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, ValidationError
 
 from astrbot.api import logger
 from astrbot.api.provider import Provider
 from ..storage.faiss_manager import FaissManager, Result
 
 
+# --- 新的数据模型 ---
+class EventType(str, Enum):
+    FACT = "fact"
+    PREFERENCE = "preference"
+    GOAL = "goal"
+    OPINION = "opinion"
+    RELATIONSHIP = "relationship"
+    OTHER = "other"
+
+
+class Entity(BaseModel):
+    name: str = Field(..., description="实体名称")
+    type: str = Field(..., description="实体类型")
+
+
+class MemoryEvent(BaseModel):
+    # --- 系统生成字段 (不再由 LLM 提供) ---
+    id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()), description="唯一的事件ID"
+    )
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="事件创建的UTC时间戳",
+    )
+
+    # --- LLM 生成字段 ---
+    importance_score: float = Field(
+        ..., ge=0.0, le=1.0, description="记忆的重要性评分 (0.0-1.0)"
+    )
+    memory_content: str = Field(..., description="对事件的简洁、客观的描述")
+    event_type: EventType = Field(default=EventType.OTHER, description="事件的分类")
+    entities: List[Entity] = Field(
+        default_factory=list, description="事件中涉及的关键实体"
+    )
+
+    # --- 系统关联字段 ---
+    related_event_ids: List[str] = Field(
+        default_factory=list, description="与此事件相关的其他事件ID"
+    )
+
+    # --- 原始上下文信息 ---
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="用于存储其他附加信息的灵活字段，例如来源会话、人格等",
+    )
+
+
+class MemoryEventList(BaseModel):
+    events: List[MemoryEvent]
+
+
+# --- 用于生成 Prompt Schema 的私有模型 ---
+class _LLMEvent(BaseModel):
+    importance_score: float = Field(..., ge=0.0, le=1.0)
+    memory_content: str = Field(...)
+    event_type: EventType = Field(default=EventType.OTHER)
+    entities: List[Entity] = Field(default_factory=list)
+    related_event_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class _LLMEventList(BaseModel):
+    events: List[_LLMEvent]
+
+
+# --- 引擎实现 ---
 class ReflectionEngine:
     """
-    反思引擎：负责对会话历史进行反思，生成、评估并存储高质量的记忆。
+    反思引擎：负责对会话历史进行反思，提取、评估并存储多个独立的、基于事件的记忆。
     """
 
     def __init__(
@@ -31,13 +101,13 @@ class ReflectionEngine:
 
         Args:
             config (Dict[str, Any]): 插件配置中 'reflection_engine' 部分的字典。
-            llm_provider (Provider): 用于总结和评估的 LLM Provider。
+            llm_provider (Provider): 用于提取和评估的 LLM Provider。
             faiss_manager (FaissManager): 数据库管理器实例。
         """
         self.config = config
         self.llm_provider = llm_provider
         self.faiss_manager = faiss_manager
-        logger.info("ReflectionEngine 初始化成功。")
+        logger.info("ReflectionEngine 初始化成功 (v2 - Event-based)。")
 
     async def reflect_and_store(
         self,
@@ -51,74 +121,146 @@ class ReflectionEngine:
         这是一个后台任务，不应阻塞主流程。
         """
         try:
-            # 1. 格式化历史记录用于总结
+            # 1. 格式化历史记录
             history_text = self._format_history_for_summary(conversation_history)
             if not history_text:
                 logger.debug("对话历史为空，跳过反思。")
                 return
 
-            # 2. 请求 LLM 进行总结
-            logger.info(f"[{session_id}] 开始总结对话历史...")
-            summary_prompt = self.config.get("summary_prompt", "")
+            # 2. 构建新的 Prompt，要求 LLM 以 JSON 格式返回事件列表
+            summary_prompt = self._build_event_extraction_prompt(persona_prompt)
 
-            # 构建带有可选人格的 system prompt
-            if persona_prompt:
-                summary_prompt += f"请注意，你需要代入以下人格进行总结。注意人格内容不是记忆内容，不能混淆在记忆中。\n人格设定如下：\n<persona>{persona_prompt}</persona>"
+            user_prompt = f"下面是你需要分析的对话历史：\n{history_text}"
 
-            summary_response = await self.llm_provider.text_chat(
-                prompt=history_text,
+            # 3. 请求 LLM 提取事件
+            logger.info(f"[{session_id}] 开始从对话历史中提取记忆事件...")
+
+            # 假设 provider 支持 json_mode，如果不支持，prompt 的健壮性至关重要
+            response = await self.llm_provider.text_chat(
+                prompt=user_prompt,
                 system_prompt=summary_prompt,
+                json_mode=True,  # 启用 JSON 模式
             )
-            summary_text = summary_response.completion_text.strip()
-            if not summary_text:
-                logger.warning(f"[{session_id}] LLM 总结返回为空，任务中止。")
+
+            response_text = response.completion_text.strip()
+            if not response_text:
+                logger.warning(f"[{session_id}] LLM 提取事件返回为空，任务中止。")
                 return
-            logger.info(f"[{session_id}] 对话总结完成，长度: {len(summary_text)}。")
-            logger.debug(f"[{session_id}] 总结内容: {summary_text}")
 
-            # 3. 请求 LLM 评估重要性
-            logger.info(f"[{session_id}] 开始评估记忆重要性...")
-            evaluation_prompt_template = self.config.get("evaluation_prompt", "")
-            evaluation_prompt = evaluation_prompt_template.format(
-                memory_content=summary_text
-            )
-            if persona_prompt:
-                evaluation_prompt += f"\n请注意，你需要代入以下人格进行评估。\n人格设定如下：\n<persona>{persona_prompt}</persona>"
-
-            evaluation_response = await self.llm_provider.text_chat(
-                prompt=evaluation_prompt
-            )
-
+            # 4. 解析和验证返回的 JSON
             try:
-                importance_score = float(evaluation_response.completion_text.strip())
-            except (ValueError, TypeError):
-                logger.warning(
-                    f"[{session_id}] LLM 重要性评估返回格式错误: '{evaluation_response.completion_text}'，将使用默认值 0.0。"
-                )
-                importance_score = 0.0
-            logger.info(
-                f"[{session_id}] 记忆重要性评估完成，得分: {importance_score:.2f}。"
-            )
-
-            # 4. 根据阈值决定是否存储
-            threshold = self.config.get("importance_threshold", 0.5)
-            if importance_score >= threshold:
-                await self.faiss_manager.add_memory(
-                    content=summary_text,
-                    importance=importance_score,
-                    session_id=session_id,
-                    persona_id=persona_id,
-                )
+                memory_event_list = MemoryEventList.model_validate_json(response_text)
                 logger.info(
-                    f"[{session_id}] 记忆得分高于阈值 {threshold}，已成功存入数据库。"
+                    f"[{session_id}] 成功解析 {len(memory_event_list.events)} 个记忆事件。"
                 )
+            except (ValidationError, json.JSONDecodeError) as e:
+                logger.error(
+                    f"[{session_id}] LLM 返回的 JSON 无效或不符合模型定义: {e}\n原始返回: {response_text}",
+                    exc_info=True,
+                )
+                return
+
+            # 5. 迭代、评估和存储每个事件
+            threshold = self.config.get("importance_threshold", 0.5)
+            stored_count = 0
+            for event in memory_event_list.events:
+                if event.importance_score >= threshold:
+                    # 将整个 Event 对象序列化为 JSON 存入元数据
+                    event_metadata = json.loads(event.model_dump_json())
+
+                    await self.faiss_manager.add_memory(
+                        content=event.memory_content,
+                        importance=event.importance_score,
+                        session_id=session_id,
+                        persona_id=persona_id,
+                        metadata=event_metadata,
+                    )
+                    stored_count += 1
+                    logger.debug(
+                        f"[{session_id}] 存储记忆事件 '{event.id}'，得分 {event.importance_score:.2f}"
+                    )
+                else:
+                    logger.debug(
+                        f"[{session_id}] 忽略记忆事件 '{event.id}'，得分 {event.importance_score:.2f} 低于阈值 {threshold}。"
+                    )
+
+            if stored_count > 0:
+                logger.info(f"[{session_id}] 成功存储 {stored_count} 个新的记忆事件。")
             else:
-                logger.info(f"[{session_id}] 记忆得分低于阈值 {threshold}，已被忽略。")
+                logger.info(f"[{session_id}] 没有新的记忆事件达到存储阈值。")
 
         except Exception as e:
             logger.error(
                 f"[{session_id}] 在执行反思与存储任务时发生严重错误: {e}", exc_info=True
             )
+
+    def _build_event_extraction_prompt(self, persona_prompt: Optional[str]) -> str:
+        """构建用于提取记忆事件的系统 Prompt。"""
+
+        # 1. 从 Pydantic 模型生成 JSON Schema，但要排除系统生成的字段
+        schema = _LLMEventList.model_json_schema()
+
+        # 2. 从配置或默认值获取基础 prompt
+        base_prompt = self.config.get(
+            "event_extraction_prompt",
+            """
+你是一个善于分析和总结的AI助手。你的任务是仔细阅读一段对话历史，并从中提取出多个独立的、有意义的记忆事件。
+这些事件可以是关于事实、用户的偏好、目标、观点或你们之间关系的变化。
+
+你需要为每个提取的事件评估一个重要性分数（0.0到1.0之间），分数越高代表该记忆越关键、越长久。
+
+请严格按照下面提供的 JSON 格式返回你的分析结果，不要添加任何额外的解释或文字。
+""",
+        ).strip()
+
+        persona_section = ""
+        if persona_prompt:
+            persona_section = f"\n**重要：**在分析和评估时，请代入以下人格。这会影响你对“重要性”的判断，但注意不要将人格设定本身记录为记忆。\n<persona>{persona_prompt}</persona>\n"
+
+        # 3. 最终的 Prompt 组合
+        full_prompt = f"""{base_prompt}
+{persona_section}
+**核心指令**
+1.  **分析对话**: 从下面的对话历史中提取关键事件。
+2.  **评估重要性**: 为每个事件打分 (0.0 - 1.0)。
+3.  **格式化输出**: 必须返回一个符合以下 JSON Schema 的 JSON 对象。
+
+**输出格式要求 (JSON Schema)**
+```json
+{json.dumps(schema, indent=2)}
+```
+
+**注意：你绝对不能在输出的 JSON 中包含 `id` 或 `timestamp` 字段。这些将由系统自动生成。**
+
+**一个正确的输出示例**
+```json
+{{
+  "events": [
+    {{
+      "importance_score": 0.8,
+      "memory_content": "用户表示他最喜欢的编程语言是 Python，因为其简洁性和强大的库支持。",
+      "event_type": "preference",
+      "entities": [
+        {{"name": "Python", "type": "Programming Language"}}
+      ],
+      "related_event_ids": [],
+      "metadata": {{}}
+    }},
+    {{
+      "importance_score": 0.9,
+      "memory_content": "用户设定了一个目标，希望在本季度内完成他的个人项目'Project Phoenix'。",
+      "event_type": "goal",
+      "entities": [
+        {{"name": "Project Phoenix", "type": "Project"}}
+      ],
+      "related_event_ids": [],
+      "metadata": {{"priority": "high"}}
+    }}
+  ]
+}}
+```
+"""
+        return full_prompt
 
     def _format_history_for_summary(self, history: List[Dict[str, str]]) -> str:
         """

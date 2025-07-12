@@ -33,7 +33,7 @@ class FaissManager:
         importance: float,
         session_id: str,
         persona_id: Optional[str] = None,
-        extra_meta: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         添加一条新的记忆到数据库。
@@ -43,21 +43,28 @@ class FaissManager:
             importance (float): 记忆的重要性评分 (0.0 to 1.0)。
             session_id (str): 当前的会话 ID。
             persona_id (Optional[str], optional): 当前的人格 ID. Defaults to None.
-            extra_meta (Optional[Dict[str, Any]], optional): 其他额外的元数据. Defaults to None.
+            metadata (Optional[Dict[str, Any]], optional): 完整的事件元数据. Defaults to None.
 
         Returns:
             int: 插入的记忆在数据库中的主键 ID。
         """
-        current_timestamp = int(time.time())
-        metadata = {
-            "importance": importance,
-            "create_time": current_timestamp,
-            "last_access_time": current_timestamp,
-            "session_id": session_id,
-            "persona_id": persona_id,
-        }
-        if extra_meta:
-            metadata.update(extra_meta)
+        # 如果传入了完整的 metadata (来自新的 Event-based 流程)，直接使用
+        if metadata:
+            # 确保基础字段存在
+            metadata.setdefault("importance", importance)
+            metadata.setdefault("session_id", session_id)
+            metadata.setdefault("persona_id", persona_id)
+            metadata.setdefault("last_access_time", metadata.get("timestamp"))
+        else:
+            # 兼容旧的或简单的调用方式
+            current_timestamp = int(time.time())
+            metadata = {
+                "importance": importance,
+                "create_time": current_timestamp,
+                "last_access_time": current_timestamp,
+                "session_id": session_id,
+                "persona_id": persona_id,
+            }
 
         inserted_id = await self.db.insert(content=content, metadata=metadata)
         return inserted_id
@@ -188,9 +195,9 @@ class FaissManager:
             return
 
         # 从 Faiss 中删除
-        self.db.embedding_storage.index.remove_ids(np.array(doc_ids))
+        self.db.embedding_storage.index.remove_ids(np.array(doc_ids, dtype=np.int64))
         await self.db.embedding_storage.save_index()
 
         # 从 SQLite 中删除
-        # TODO 没有实现，先不管
+        # TODO delete_documents 并没有被实现
         # await self.db.document_storage.delete_documents(doc_ids)
