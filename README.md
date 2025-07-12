@@ -136,4 +136,4 @@ Score: 0.78
 
 ## 📄 许可证
 
-本项目采用 [MIT License](LICENSE) 开源。
+本项目遵循 AGPLv3 许可证。请查看 [LICENSE](LICENSE) 文件以获取更多信息。
