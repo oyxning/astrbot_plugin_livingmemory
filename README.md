@@ -1,8 +1,21 @@
 # LivingMemory - 动态生命周期记忆插件
 
-<p align="center">
-  <span style="font-size: 5rem;">🧠</span>
-</p>
+
+<div align="center">
+
+<img src="https://img.shields.io/badge/状态-开发中-critical?style=for-the-badge&logo=github" alt="开发中" />
+
+<details open>
+<summary><strong>🚧 施工警示卡</strong></summary>
+
+> ⚠️ **本插件处于开发阶段**  
+> 部分功能尚未完善或可能存在不稳定情况。  
+> 使用过程中如遇到问题，欢迎通过 Issue 反馈！
+
+</details>
+
+</div>
+
 
 <p align="center">
   <i>为 AstrBot 打造的、拥有完整记忆生命周期的智能长期记忆插件。</i>
