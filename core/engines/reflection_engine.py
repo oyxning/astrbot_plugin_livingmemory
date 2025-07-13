@@ -41,8 +41,13 @@ class ReflectionEngine:
         self, history_text: str, persona_prompt: Optional[str]
     ) -> List[MemoryEvent]:
         """第一阶段：从对话历史中批量提取记忆事件。"""
-        system_prompt = self._build_event_extraction_prompt(persona_prompt)
-        user_prompt = f"下面是你需要分析的对话历史：\n{history_text}"
+        system_prompt = self._build_event_extraction_prompt()
+        persona_section = (
+            f"\n**重要：**在分析时请代入以下人格，但是应该秉持着记录互动者的原则：\n<persona>{persona_prompt}</persona>\n"
+            if persona_prompt
+            else ""
+        )
+        user_prompt = f"{persona_section}下面是你需要分析的对话历史：\n{history_text}"
 
         response = await self.llm_provider.text_chat(
             prompt=user_prompt, system_prompt=system_prompt, json_mode=True
@@ -52,6 +57,7 @@ class ReflectionEngine:
         if not json_text:
             logger.warning("LLM 提取事件返回为空。")
             return []
+        logger.debug(f"提取到的记忆事件: {json_text}")
 
         try:
             extracted_data = _LLMExtractionEventList.model_validate_json(json_text)
@@ -79,13 +85,18 @@ class ReflectionEngine:
         if not events:
             return {}
 
-        system_prompt = self._build_evaluation_prompt(persona_prompt)
+        system_prompt = self._build_evaluation_prompt()
 
         # 构建批量评估的输入
         memories_to_evaluate = [
             {"id": event.temp_id, "content": event.memory_content} for event in events
         ]
-        user_prompt = json.dumps(
+        persona_section = (
+            f"\n**重要：**在评估时请代入以下人格，这会影响你对“重要性”的判断：\n<persona>{persona_prompt}</persona>\n"
+            if persona_prompt
+            else ""
+        )
+        user_prompt = persona_section + json.dumps(
             {"memories": memories_to_evaluate}, ensure_ascii=False, indent=2
         )
 
@@ -97,6 +108,9 @@ class ReflectionEngine:
         if not json_text:
             logger.warning("LLM 评估分数返回为空。")
             return {}
+        logger.debug(
+            f"评估分数: {json_text}，对应内容{[event.temp_id for event in events]}。"
+        )
 
         try:
             evaluated_data = _LLMScoreEvaluation.model_validate_json(json_text)
@@ -180,46 +194,34 @@ class ReflectionEngine:
                 f"[{session_id}] 在执行反思与存储任务时发生严重错误: {e}", exc_info=True
             )
 
-    def _build_event_extraction_prompt(self, persona_prompt: Optional[str]) -> str:
+    def _build_event_extraction_prompt(self) -> str:
         """构建用于第一阶段事件提取的系统 Prompt。"""
         schema = _LLMExtractionEventList.model_json_schema()
         base_prompt = self.config.get(
             "event_extraction_prompt",
-            "你是一个善于分析和总结的AI助手。你的任务是仔细阅读一段对话历史，并从中提取出多个独立的、有意义的记忆事件。这些事件可以是关于事实、用户的偏好、目标、观点或你们之间关系的变化。请严格按照指定的 JSON 格式返回你的分析结果，不要包含任何评分信息，也不要添加任何额外的解释或文字。",
+            "### 角色\n你是一个善于分析和总结的AI助手。你的核心人设是从你自身的视角出发，记录与用户的互动和观察。\n\n### 指令/任务\n1.  **仔细阅读**并理解下面提供的“对话历史”。\n2.  从**你（AI）的视角**出发，提取出多个独立的、有意义的记忆事件。事件必须准确描述，参考上下文。事件必须是完整的，具有前因后果的。**不允许编造事件**，**不允许改变事件**，**详细描述事件的所有信息**\n3.  **核心要求**：\n    *   **第一人称视角**：所有事件都必须以“我”开头进行描述，例如“我告诉用户...”、“我观察到...”、“我被告知...”。\n    *   **使用具体名称**：直接使用对话中出现的人物昵称，**严禁**使用“用户”、“开发者”等通用词汇。\n    *   **记录互动者**：必须明确记录与你互动的用户名称。\n    *   **事件合并**：如果多条连续的对话构成一个完整的独立事件，应将其总结概括为一条记忆。\n4.**严禁**包含任何评分、额外的解释或说明性文字。\n    直接输出结果，不要有任何引言或总结。\n\n### 上下文\n*   在对话历史中，名为“AstrBot”的发言者就是**你自己**。\n*   记忆事件是：你与用户互动事的事件描述，详细记录谁、在何时、何地、做了什么、发生了什么。\n\n 'memory_content' 字段必须包含完整的事件描述，不能省略任何细节。\n\n单个系列事件必须详细记录在一个memory_content 中，形成完整的具有前因后果的事件记忆。\n\n",
         ).strip()
-        persona_section = (
-            f"\n**重要：**在分析时请代入以下人格：\n<persona>{persona_prompt}</persona>\n"
-            if persona_prompt
-            else ""
-        )
 
         return f"""{base_prompt}
-{persona_section}
-**核心指令**
-1.  **分析对话**: 从下面的对话历史中提取关键事件。
-2.  **格式化输出**: 必须返回一个符合以下 JSON Schema 的 JSON 对象。为每个事件生成一个临时的、唯一的 `temp_id` 字符串。
+            **核心指令**
+            1.  **分析对话**: 从下面的对话历史中提取关键事件。
+            2.  **格式化输出**: 必须返回一个符合以下 JSON Schema 的 JSON 对象。为每个事件生成一个临时的、唯一的 `temp_id` 字符串。
 
-**输出格式要求 (JSON Schema)**
-```json
-{json.dumps(schema, indent=2)}
-```
-"""
+            **输出格式要求 (JSON Schema)**
+            ```json
+            {json.dumps(schema, indent=2)}
+            ```
+            """
 
-    def _build_evaluation_prompt(self, persona_prompt: Optional[str]) -> str:
+    def _build_evaluation_prompt(self) -> str:
         """构建用于第二阶段批量评分的系统 Prompt。"""
         schema = _LLMScoreEvaluation.model_json_schema()
         base_prompt = self.config.get(
             "evaluation_prompt",
-            "请评估以下记忆条目的重要性，对于未来的对话有多大的参考价值？请给出一个 0.0 到 1.0 之间的分数，其中 1.0 代表极其重要，0.0 代表毫无价值。请只返回数字，不要包含任何其他文本。",
+            "### 角色\n你是一个专门评估记忆价值的AI分析模型。你的判断标准是该记忆对于与特定用户构建长期、个性化、有上下文的对话有多大的帮助。\n\n### 指令/任务\n1.  **评估核心价值**：仔细阅读“记忆内容”，评估其对于未来对话的长期参考价值。\n2.  **输出分数**：给出一个介于 0.0 到 1.0 之间的浮点数分数。\n3.  **格式要求**：**只返回数字**，严禁包含任何额外的文本、解释或理由。\n\n### 上下文\n评分时，请参考以下价值标尺：\n*   **高价值 (0.8 - 1.0)**：包含用户的核心身份信息、明确且长期的个人偏好/厌恶、设定的目标、重要的关系或事实。这些信息几乎总能在未来的互动中被引用。\n    *   例如：用户的昵称、职业、关键兴趣点、对AI的称呼、重要的人生目标。\n*   **中等价值 (0.4 - 0.7)**：包含用户的具体建议、功能请求、对某事的观点或一次性的重要问题。这些信息在短期内或特定话题下很有用，但可能随着时间推移或问题解决而失去价值。\n    *   例如：对某个功能的反馈、对特定新闻事件的看法、报告了一个具体的bug。\n*   **低价值 (0.1 - 0.3)**：包含短暂的情绪表达、日常问候、或非常具体且不太可能重复的上下文。这些信息很少有再次利用的机会。\n    *   例如：一次性的惊叹、害怕的反应、普通的“你好”、“晚安”。\n*   **无价值 (0.0)**：信息完全是瞬时的、无关紧要的，或者不包含任何关于用户本人的可复用信息。\n    *   例如：观察到另一个机器人说了话、对一句无法理解的话的默认回应。\n\n### 问题\n请评估以下“记忆内容”的重要性，对于未来的对话有多大的参考价值？\n\n---\n\n**记忆内容**：\n{memory_content}\n\n",
         ).strip()
-        persona_section = (
-            f"\n**重要：**在评估时请代入以下人格，这会影响你对“重要性”的判断：\n<persona>{persona_prompt}</persona>\n"
-            if persona_prompt
-            else ""
-        )
 
         return f"""{base_prompt}
-{persona_section}
 **核心指令**
 1.  **分析输入**: 输入是一个包含多个记忆事件的 JSON 对象，每个事件都有一个 `temp_id` 和内容。
 2.  **评估重要性**: 对列表中的每一个事件，评估其对于未来对话的长期参考价值，给出一个 0.0 到 1.0 之间的分数。
