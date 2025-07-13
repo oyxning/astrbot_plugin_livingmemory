@@ -43,7 +43,7 @@
 
 ---
 
-`LivingMemory` 告别了传统记忆插件对大型数据库的依赖，创新性地采用轻量级的 `Faiss` 和 `SQLite` 作为存储后端。这不仅实现了 **零配置部署** 和 **极低的资源消耗**，更引入了革命性的 **动态记忆生命周期 (Dynamic Memory Lifecycle)** 模型。
+`LivingMemory` 告别了传统记忆插件`astrbot_plugin_mnemosyne`对大型数据库的依赖，创新性地采用轻量级的 `Faiss` 和 `SQLite` 作为存储后端。这不仅实现了 **零配置部署** 和 **极低的资源消耗**，更引入了革命性的 **动态记忆生命周期 (Dynamic Memory Lifecycle)** 模型。
 
 ## ✨ 核心特性：动态记忆生命周期
 
@@ -113,33 +113,6 @@ faiss-cpu
 | `/lmem search` | `<query> [k=3]` | 手动搜索与 `<query>` 相关的记忆，并以卡片形式展示结果。 |
 | `/lmem forget` | `<memory_id>` | 强制删除一条指定整数 ID 的记忆。 |
 | `/lmem run_forgetting_agent` | - | 手动触发一次遗忘代理的清理任务。 |
-
-<details>
-<summary><strong>💡 点击展开 `lmem search` 输出示例</strong></summary>
-
-```
-[LivingMemory] 搜索到 3 条相关记忆:
----
-[Card]
-ID: 101
-Created: 2023-10-27 10:30:00 (Asia/Shanghai)
-Content: 用户表示对自然语言处理技术很感兴趣。
-Score: 0.89
----
-[Card]
-ID: 102
-Created: 2023-10-27 11:00:00 (Asia/Shanghai)
-Content: 用户询问了关于 Transformer 模型的细节。
-Score: 0.85
----
-[Card]
-ID: 105
-Created: 2023-10-28 14:15:00 (Asia/Shanghai)
-Content: 用户最近在学习 PyTorch 框架。
-Score: 0.78
-```
-
-</details>
 
 ---
 

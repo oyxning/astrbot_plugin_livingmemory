@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 # AstrBot API
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent,MessageChain
 from astrbot.api.event.filter import PermissionType, permission_type
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api.provider import (
@@ -356,20 +356,17 @@ class LivingMemoryPlugin(Star):
             return
 
         yield event.plain_result("正在后台手动触发遗忘代理任务...")
-
-        # 使用 create_task 以避免阻塞当前事件循环
-        async def run_and_notify():
-            try:
-                await self.forgetting_agent._prune_memories()
-                await self.context.send_message(
-                    event.unified_msg_origin, "遗忘代理任务执行完毕。"
-                )
-            except Exception as e:
-                await self.context.send_message(
-                    event.unified_msg_origin, f"遗忘代理任务执行失败: {e}"
-                )
-
-        asyncio.create_task(run_and_notify())
+        try:
+            logger.debug("1")
+            await self.forgetting_agent._prune_memories()
+            await self.context.send_message(
+                event.unified_msg_origin, MessageChain().message("遗忘代理任务执行完毕。")
+            )
+        except Exception as e:
+            logger.error(f"遗忘代理任务执行失败: {e}", exc_info=True)
+            await self.context.send_message(
+                event.unified_msg_origin, MessageChain().message(f"遗忘代理任务执行失败: {e}")
+            )
 
     async def terminate(self):
         """

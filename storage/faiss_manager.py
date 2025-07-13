@@ -156,30 +156,14 @@ class FaissManager:
 
         await self.db.document_storage.connection.commit()
 
-    async def get_all_memories_for_forgetting(
-        self, batch_size: int = 100
-    ) -> List[Dict[str, Any]]:
+    async def get_all_memories_for_forgetting(self) -> List[Dict[str, Any]]:
         """
         获取所有记忆及其元数据，用于遗忘代理的处理。
-        使用分页以避免一次性加载过多数据。
-
-        Args:
-            batch_size (int): 每次从数据库获取的记录数。
 
         Returns:
             List[Dict[str, Any]]: 包含所有记忆数据的列表。
         """
-        all_docs = []
-        offset = 0
-        while True:
-            docs = await self.db.document_storage.get_all_documents(
-                limit=batch_size, offset=offset
-            )
-            if not docs:
-                break
-            all_docs.extend(docs)
-            offset += batch_size
-        return all_docs
+        return await self.db.document_storage.get_documents(metadata_filters={})
 
     async def update_memories_metadata(self, memories: List[Dict[str, Any]]):
         """
