@@ -292,7 +292,7 @@ class LivingMemoryPlugin(Star):
             yield event.plain_result(f"未能找到与 '{query}' 相关的记忆。")
             return
 
-        response_parts = [f"Found {len(results)} memories:"]
+        response_parts = [f"为您找到 {len(results)} 条相关记忆："]
         tz = get_now_datetime(self.context).tzinfo  # 获取当前时区
 
         for res in results:
@@ -303,25 +303,34 @@ class LivingMemoryPlugin(Star):
                 except json.JSONDecodeError:
                     metadata = {}
 
-            create_time_ts = metadata.get("create_time", 0)
-            try:
-                # 从时间戳创建 UTC datetime 对象，然后转换为本地时区
-                dt_utc = datetime.fromtimestamp(create_time_ts, tz=timezone.utc)
-                dt_local = dt_utc.astimezone(tz)
-                create_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-            except (ValueError, TypeError):
-                create_time_str = "未知"
+            def format_timestamp(ts):
+                if not ts:
+                    return "未知"
+                try:
+                    dt_utc = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                    dt_local = dt_utc.astimezone(tz)
+                    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    return "未知"
+
+            create_time_str = format_timestamp(metadata.get("create_time"))
+            last_access_time_str = format_timestamp(metadata.get("last_access_time"))
+
+            importance_score = metadata.get("importance", 0.0)
+            event_type = metadata.get("event_type", "未知")
 
             card = (
-                f"---\n"
                 f"ID: {res.data['id']}\n"
-                f"Created At: {create_time_str}\n"
-                f"Content: {res.data['text']}\n"
-                f"Score: {res.similarity:.2f}"
+                f"记 忆 度: {res.similarity:.2f}\n"
+                f"重 要 性: {importance_score:.2f}\n"
+                f"记忆类型: {event_type}\n\n"
+                f"内容: {res.data['text']}\n\n"
+                f"创建于: {create_time_str}\n"
+                f"最后访问: {last_access_time_str}"
             )
             response_parts.append(card)
 
-        response = "\n".join(response_parts) + "\n---"
+        response = "\n\n".join(response_parts)
         yield event.plain_result(response)
 
     @permission_type(PermissionType.ADMIN)
