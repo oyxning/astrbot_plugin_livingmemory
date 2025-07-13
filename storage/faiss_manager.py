@@ -211,5 +211,7 @@ class FaissManager:
         await self.db.embedding_storage.save_index()
 
         # 从 SQLite 中删除
-        # TODO delete_documents 并没有被实现
-        # await self.db.document_storage.delete_documents(doc_ids)
+        placeholders = ",".join("?" for _ in doc_ids)
+        sql = f"DELETE FROM documents WHERE id IN ({placeholders})"
+        await self.db.document_storage.connection.execute(sql, doc_ids)
+        await self.db.document_storage.connection.commit()
