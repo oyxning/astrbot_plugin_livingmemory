@@ -61,25 +61,28 @@ class FaissManagerV2:
         """
         添加一条新的、结构化的记忆。
         """
-        # 1. 确保 memory_id 存在
         if not memory.memory_id:
             memory.memory_id = str(uuid.uuid4())
 
-        # 2. 确保 embedding 存在 (如果未预先计算)
         if not memory.embedding:
             memory.embedding = self.embedding_model.encode(memory.description)
 
-        # 3. 将记忆存入 SQLite 并获取内部 ID
+        # 1. 存入 SQLite 并获取内部 ID
         internal_id = await self.storage.add_memory(memory)
+
+        # 2. 将文本向量添加到 text_vstore
+        if memory.embedding:
+            self.text_vstore.add([internal_id], [memory.embedding])
+
+        # 3. 将图像向量添加到 image_vstore
         media_embeddings = [
             media.embedding for media in memory.linked_media if media.embedding
         ]
         if media_embeddings:
-            # 所有媒体向量都指向同一个记忆的 internal_id
             media_ids = [internal_id] * len(media_embeddings)
             self.image_vstore.add(media_ids, media_embeddings)
 
-        # 将知识图谱负载添加到图数据库
+        # 4. 将图数据添加到 graph_storage
         if memory.knowledge_graph_payload:
             await self.graph_storage.add_memory_graph(
                 internal_id, memory.knowledge_graph_payload.to_dict()
