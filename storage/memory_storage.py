@@ -2,7 +2,7 @@
 
 import json
 import aiosqlite
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from ..core.models.memory_models import Memory
 
@@ -12,27 +12,37 @@ class MemoryStorage:
     用于在 SQLite 中持久化、检索和管理结构化 Memory 对象的类。
     """
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.connection: Optional[aiosqlite.Connection] = None
+    def __init__(self, connection: aiosqlite.Connection):
+        """
+        修正: 接收一个已建立的 aiosqlite 连接
+        """
+        self.connection = connection
 
-    async def connect(self):
+    async def initialize_schema(self):
         """
         建立数据库连接并创建表
         """
-        self.connection = await aiosqlite.connect(self.db_path)
-        await self.connection.execute("PRAGMA journal_mode=WAL;")
-
-        await self.connection.execute("PRAGMA busy_timeout = 5000;")
+        # 修正: 创建包含所有需要字段的表
         await self.connection.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 memory_id TEXT NOT NULL UNIQUE,
+                timestamp TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                importance_score REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                community_id TEXT,  -- 为社区发现预留字段
                 memory_data TEXT NOT NULL
             )
         """)
         await self.connection.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_id ON memories (memory_id);
+        """)
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_status ON memories (status);
+        """)
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_community ON memories (community_id);
         """)
         await self.connection.commit()
 
@@ -49,8 +59,7 @@ class MemoryStorage:
         将一个 Memory 对象添加到数据库，并返回其内部自增 ID。
         """
         memory_json = json.dumps(memory.to_dict(), ensure_ascii=False)
-        # 'active' 是默认状态
-        status = "active"
+        status = "active"  # 默认状态
 
         cursor = await self.connection.execute(
             """
