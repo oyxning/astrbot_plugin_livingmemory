@@ -2,14 +2,14 @@
 import uuid
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 import aiosqlite
 
 from ..core.models.memory_models import (
     Memory,
-    AccessInfo,
-    UserFeedback,
-    EmotionalValence,
+    AccessInfo,  # noqa: F401
+    UserFeedback,  # noqa: F401
+    EmotionalValence,  # noqa: F401
 )
 from .memory_storage import MemoryStorage
 from .vector_store import VectorStore
