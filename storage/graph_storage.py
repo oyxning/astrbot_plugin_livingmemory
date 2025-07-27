@@ -87,17 +87,23 @@ class GraphStorageSQLite:
         使用 SQL 递归查询 (Recursive CTE) 从一个实体出发，查找相关联的记忆 internal_id。
         """
         query = """
-        WITH RECURSIVE graph_walk(source, target, depth, mem_id) AS (
-            SELECT source_id, target_id, 1, memory_internal_id FROM graph_edges WHERE source_id = :entity_id
-            UNION ALL
-            SELECT source_id, target_id, 1, memory_internal_id FROM graph_edges WHERE target_id = :entity_id
+        WITH RECURSIVE graph_walk(node_id, depth) AS (
+            -- 递归的起始点
+            VALUES(:entity_id, 0)
             UNION
-            SELECT e.source_id, e.target_id, w.depth + 1, e.memory_internal_id
-            FROM graph_edges e
-            JOIN graph_walk w ON (e.source_id = w.target OR e.target_id = w.source)
+            -- 递归步骤: 从当前节点找到所有相邻节点
+            SELECT g.target_id, w.depth + 1
+            FROM graph_edges g JOIN graph_walk w ON g.source_id = w.node_id
+            WHERE w.depth < :max_depth
+            UNION
+            SELECT g.source_id, w.depth + 1
+            FROM graph_edges g JOIN graph_walk w ON g.target_id = w.node_id
             WHERE w.depth < :max_depth
         )
-        SELECT DISTINCT mem_id FROM graph_walk;
+        -- 从所有遍历到的节点中，查找它们作为关系边出现时关联的记忆ID
+        SELECT DISTINCT T.memory_internal_id
+        FROM graph_edges T
+        JOIN graph_walk W ON T.source_id = W.node_id OR T.target_id = W.node_id;
         """
         async with self.conn.execute(
             query, {"entity_id": entity_id, "max_depth": max_depth}
