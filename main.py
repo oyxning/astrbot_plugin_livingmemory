@@ -368,6 +368,222 @@ class LivingMemoryPlugin(Star):
                 event.unified_msg_origin, MessageChain().message(f"遗忘代理任务执行失败: {e}")
             )
 
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("edit")
+    async def lmem_edit(self, event: AstrMessageEvent, memory_id: str, field: str, value: str, reason: str = ""):
+        """[管理员] 编辑记忆内容或元数据。
+        
+        用法: /lmem edit <id> <字段> <值> [原因]
+        
+        字段:
+          content - 记忆内容
+          importance - 重要性评分 (0.0-1.0)
+          type - 事件类型 (FACT/PREFERENCE/GOAL/OPINION/RELATIONSHIP/OTHER)
+          status - 状态 (active/archived/deleted)
+        
+        示例:
+          /lmem edit 123 content 这是新的记忆内容 修正了错误信息
+          /lmem edit 123 importance 0.9 提高重要性
+          /lmem edit 123 type PREFERENCE 重新分类
+          /lmem edit 123 status archived 项目已完成
+        """
+        if not self.faiss_manager:
+            yield event.plain_result("记忆库尚未初始化。")
+            return
+
+        try:
+            # 解析 memory_id 为整数或字符串
+            try:
+                memory_id_int = int(memory_id)
+                memory_id_to_use = memory_id_int
+            except ValueError:
+                memory_id_to_use = memory_id
+
+            # 解析字段和值
+            updates = {}
+            
+            if field == "content":
+                updates["content"] = value
+            elif field == "importance":
+                try:
+                    updates["importance"] = float(value)
+                    if not 0.0 <= updates["importance"] <= 1.0:
+                        yield event.plain_result("❌ 重要性评分必须在 0.0 到 1.0 之间")
+                        return
+                except ValueError:
+                    yield event.plain_result("❌ 重要性评分必须是数字")
+                    return
+            elif field == "type":
+                valid_types = ["FACT", "PREFERENCE", "GOAL", "OPINION", "RELATIONSHIP", "OTHER"]
+                if value not in valid_types:
+                    yield event.plain_result(f"❌ 无效的事件类型，必须是: {', '.join(valid_types)}")
+                    return
+                updates["event_type"] = value
+            elif field == "status":
+                valid_statuses = ["active", "archived", "deleted"]
+                if value not in valid_statuses:
+                    yield event.plain_result(f"❌ 无效的状态，必须是: {', '.join(valid_statuses)}")
+                    return
+                updates["status"] = value
+            else:
+                yield event.plain_result(f"❌ 未知的字段 '{field}'，支持的字段: content, importance, type, status")
+                return
+
+            # 执行更新
+            result = await self.faiss_manager.update_memory(
+                memory_id=memory_id_to_use,
+                update_reason=reason or f"更新{field}",
+                **updates
+            )
+
+            if result["success"]:
+                response_parts = [f"✅ {result['message']}"]
+                
+                if result["updated_fields"]:
+                    response_parts.append("\n📋 已更新的字段:")
+                    for f in result["updated_fields"]:
+                        response_parts.append(f"  - {f}")
+                
+                # 如果更新了内容，显示预览
+                if "content" in updates and len(updates["content"]) > 100:
+                    response_parts.append(f"\n📝 内容预览: {updates['content'][:100]}...")
+                
+                yield event.plain_result("\n".join(response_parts))
+            else:
+                yield event.plain_result(f"❌ 更新失败: {result['message']}")
+
+        except Exception as e:
+            logger.error(f"编辑记忆时发生错误: {e}", exc_info=True)
+            yield event.plain_result(f"编辑记忆时发生错误: {e}")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("update")
+    async def lmem_update(self, event: AstrMessageEvent, memory_id: str):
+        """[管理员] 交互式编辑记忆。
+        
+        用法: /lmem update <id>
+        
+        会引导你逐步选择要更新的字段。
+        """
+        if not self.faiss_manager:
+            yield event.plain_result("记忆库尚未初始化。")
+            return
+
+        try:
+            # 解析 memory_id
+            try:
+                memory_id_int = int(memory_id)
+                docs = await self.faiss_manager.db.document_storage.get_documents(ids=[memory_id_int])
+            except ValueError:
+                docs = await self.faiss_manager.db.document_storage.get_documents(
+                    metadata_filters={"memory_id": memory_id}
+                )
+
+            if not docs:
+                yield event.plain_result(f"未找到ID为 {memory_id} 的记忆。")
+                return
+
+            doc = docs[0]
+            metadata = (
+                json.loads(doc["metadata"])
+                if isinstance(doc["metadata"], str)
+                else doc["metadata"]
+            )
+
+            # 显示当前记忆信息
+            response = f"📝 记忆 {memory_id} 的当前信息:\n\n"
+            response += f"内容: {doc['content'][:100]}{'...' if len(doc['content']) > 100 else ''}\n\n"
+            response += f"重要性: {metadata.get('importance', 'N/A')}\n"
+            response += f"类型: {metadata.get('event_type', 'N/A')}\n"
+            response += f"状态: {metadata.get('status', 'active')}\n\n"
+            response += "请回复要更新的字段编号:\n"
+            response += "1. 内容\n"
+            response += "2. 重要性\n"
+            response += "3. 事件类型\n"
+            response += "4. 状态\n"
+            response += "0. 取消"
+
+            yield event.plain_result(response)
+
+            # 这里应该等待用户回复，但由于命令系统的限制，
+            # 我们只能引导用户使用 /lmem edit 命令
+            yield event.plain_result(f"\n请使用 /lmem edit {memory_id} <字段> <值> [原因] 来更新记忆")
+
+        except Exception as e:
+            logger.error(f"查看记忆时发生错误: {e}", exc_info=True)
+            yield event.plain_result(f"查看记忆时发生错误: {e}")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("history")
+    async def lmem_history(self, event: AstrMessageEvent, memory_id: str):
+        """[管理员] 查看记忆的更新历史。"""
+        if not self.faiss_manager or not self.faiss_manager.db:
+            yield event.plain_result("记忆库尚未初始化。")
+            return
+
+        try:
+            # 解析 memory_id
+            try:
+                memory_id_int = int(memory_id)
+                docs = await self.faiss_manager.db.document_storage.get_documents(ids=[memory_id_int])
+            except ValueError:
+                docs = await self.faiss_manager.db.document_storage.get_documents(
+                    metadata_filters={"memory_id": memory_id}
+                )
+
+            if not docs:
+                yield event.plain_result(f"未找到ID为 {memory_id} 的记忆。")
+                return
+
+            doc = docs[0]
+            metadata = (
+                json.loads(doc["metadata"])
+                if isinstance(doc["metadata"], str)
+                else doc["metadata"]
+            )
+
+            response_parts = [f"📝 记忆 {memory_id} 的详细信息:"]
+            response_parts.append(f"\n内容: {doc['content']}")
+            
+            # 基本信息
+            response_parts.append(f"\n📊 基本信息:")
+            response_parts.append(f"- 重要性: {metadata.get('importance', 'N/A')}")
+            response_parts.append(f"- 类型: {metadata.get('event_type', 'N/A')}")
+            response_parts.append(f"- 状态: {metadata.get('status', 'active')}")
+            
+            # 时间信息
+            tz = get_now_datetime(self.context).tzinfo
+            create_time = metadata.get('create_time')
+            if create_time:
+                dt = datetime.fromtimestamp(create_time, tz=timezone.utc)
+                dt_local = dt.astimezone(tz)
+                response_parts.append(f"- 创建时间: {dt_local.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 更新历史
+            update_history = metadata.get('update_history', [])
+            if update_history:
+                response_parts.append(f"\n🔄 更新历史 ({len(update_history)} 次):")
+                for i, update in enumerate(update_history[-5:], 1):  # 只显示最近5次
+                    timestamp = update.get('timestamp')
+                    if timestamp:
+                        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                        dt_local = dt.astimezone(tz)
+                        time_str = dt_local.strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        time_str = "未知"
+                    
+                    response_parts.append(f"\n{i}. {time_str}")
+                    response_parts.append(f"   原因: {update.get('reason', 'N/A')}")
+                    response_parts.append(f"   字段: {', '.join(update.get('fields', []))}")
+            else:
+                response_parts.append("\n🔄 暂无更新记录")
+
+            yield event.plain_result("\n".join(response_parts))
+
+        except Exception as e:
+            logger.error(f"查看记忆历史时发生错误: {e}", exc_info=True)
+            yield event.plain_result(f"查看记忆历史时发生错误: {e}")
+
     async def terminate(self):
         """
         插件停止时的清理逻辑。

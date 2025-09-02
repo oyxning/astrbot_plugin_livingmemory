@@ -6,7 +6,7 @@ FaissManager - 高级数据库管理器
 
 import time
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import numpy as np
 
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB, Result
@@ -199,3 +199,131 @@ class FaissManager:
         sql = f"DELETE FROM documents WHERE id IN ({placeholders})"
         await self.db.document_storage.connection.execute(sql, doc_ids)
         await self.db.document_storage.connection.commit()
+
+    async def update_memory(
+        self,
+        memory_id: Union[int, str],
+        content: Optional[str] = None,
+        importance: Optional[float] = None,
+        event_type: Optional[str] = None,
+        status: Optional[str] = None,
+        update_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        更新记忆内容或元数据（事务性操作）。
+
+        Args:
+            memory_id (Union[int, str]): 记忆ID（整数或UUID）
+            content (Optional[str]): 新的记忆内容，如果提供则重新计算向量
+            importance (Optional[float]): 新的重要性评分 (0.0-1.0)
+            event_type (Optional[str]): 新的事件类型
+            status (Optional[str]): 新的状态 (active/archived/deleted)
+            update_reason (Optional[str]): 更新原因，用于记录
+
+        Returns:
+            Dict[str, Any]: 更新结果，包含 success、message、updated_fields 等信息
+        """
+        try:
+            # 获取原始记忆
+            if isinstance(memory_id, int):
+                docs = await self.db.document_storage.get_documents(ids=[memory_id])
+            else:
+                # 如果是UUID，需要查询
+                docs = await self.db.document_storage.get_documents(
+                    metadata_filters={"memory_id": memory_id}
+                )
+            
+            if not docs:
+                return {
+                    "success": False,
+                    "message": f"未找到ID为 {memory_id} 的记忆",
+                    "updated_fields": []
+                }
+            
+            original_doc = docs[0]
+            original_metadata = (
+                json.loads(original_doc["metadata"])
+                if isinstance(original_doc["metadata"], str)
+                else original_doc["metadata"]
+            )
+            
+            # 准备更新数据
+            updated_metadata = original_metadata.copy()
+            updated_fields = []
+            
+            # 1. 更新内容和向量
+            if content is not None and content != original_doc["content"]:
+                # 重新计算向量
+                embedding = await self.db.embedding_provider.embed_query(content)
+                
+                # 更新数据库
+                await self.db.document_storage.connection.execute(
+                    "UPDATE documents SET content = ?, embedding = ? WHERE id = ?",
+                    (content, embedding.tobytes(), original_doc["id"]),
+                )
+                
+                # 更新 Faiss 索引
+                self.db.embedding_storage.index.remove_ids(np.array([original_doc["id"]], dtype=np.int64))
+                self.db.embedding_storage.index.add(embedding.reshape(1, -1))
+                await self.db.embedding_storage.save_index()
+                
+                updated_fields.append("content")
+            
+            # 2. 更新元数据字段
+            if importance is not None and importance != original_metadata.get("importance"):
+                updated_metadata["importance"] = importance
+                updated_fields.append("importance")
+            
+            if event_type is not None and event_type != original_metadata.get("event_type"):
+                updated_metadata["event_type"] = event_type
+                updated_fields.append("event_type")
+            
+            if status is not None and status != original_metadata.get("status", "active"):
+                updated_metadata["status"] = status
+                updated_fields.append("status")
+            
+            # 3. 记录更新历史
+            if update_reason or updated_fields:
+                update_history = updated_metadata.get("update_history", [])
+                update_record = {
+                    "timestamp": time.time(),
+                    "reason": update_reason or "手动更新",
+                    "fields": updated_fields.copy(),
+                }
+                update_history.append(update_record)
+                updated_metadata["update_history"] = update_history
+                updated_metadata["last_updated_time"] = time.time()
+            
+            # 4. 保存元数据更新
+            if updated_fields:
+                await self.db.document_storage.connection.execute(
+                    "UPDATE documents SET metadata = ? WHERE id = ?",
+                    (json.dumps(updated_metadata), original_doc["id"]),
+                )
+                
+                # 提交事务
+                await self.db.document_storage.connection.commit()
+                
+                return {
+                    "success": True,
+                    "message": f"成功更新记忆 {memory_id}",
+                    "updated_fields": updated_fields,
+                    "memory_id": original_doc["id"]
+                }
+            else:
+                return {
+                    "success": True,
+                    "message": "没有需要更新的字段",
+                    "updated_fields": [],
+                    "memory_id": original_doc["id"]
+                }
+                
+        except Exception as e:
+            # 回滚事务
+            await self.db.document_storage.connection.rollback()
+            return {
+                "success": False,
+                "message": f"更新记忆时发生错误: {str(e)}",
+                "updated_fields": [],
+                "error": str(e)
+            }

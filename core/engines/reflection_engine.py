@@ -151,16 +151,25 @@ class ReflectionEngine:
 
             # --- 第三阶段：合并与存储 ---
             threshold = self.config.get("importance_threshold", 0.5)
+            logger.info(f"[{session_id}] 阶段3：开始存储筛选，重要性阈值: {threshold}")
+            
             stored_count = 0
+            filtered_count = 0
+            total_events = len(extracted_events)
+            
+            # 详细记录所有事件的评分情况
+            logger.info(f"[{session_id}] 评分详情汇总:")
             for event in extracted_events:
                 score = scores.get(event.temp_id)
                 if score is None:
                     logger.warning(
-                        f"[{session_id}] 事件 '{event.temp_id}' 未找到对应的评分，跳过。"
+                        f"[{session_id}] ❌ 事件 '{event.temp_id}' 未找到对应的评分，跳过存储"
                     )
+                    filtered_count += 1
                     continue
 
                 event.importance_score = score
+                logger.info(f"[{session_id}] 📊 事件 '{event.temp_id}': 得分={score:.3f}, 阈值={threshold:.3f}")
 
                 if event.importance_score >= threshold:
                     # MemoryEvent 的 id 将由存储后端自动生成，这里不需要手动创建
@@ -176,18 +185,28 @@ class ReflectionEngine:
                         metadata=event_metadata,
                     )
                     stored_count += 1
-                    logger.debug(
-                        f"[{session_id}] 存储记忆事件 (ID: {inserted_id})，得分 {event.importance_score:.2f}"
+                    logger.info(
+                        f"[{session_id}] ✅ 存储记忆事件 (数据库ID: {inserted_id}, 临时ID: {event.temp_id}), 得分: {event.importance_score:.3f} >= {threshold:.3f}"
                     )
+                    logger.debug(f"[{session_id}] 存储内容预览: {event.memory_content[:100]}...")
                 else:
-                    logger.debug(
-                        f"[{session_id}] 忽略记忆事件 '{event.temp_id}'，得分 {event.importance_score:.2f} 低于阈值 {threshold}。"
+                    filtered_count += 1
+                    logger.info(
+                        f"[{session_id}] ❌ 过滤记忆事件 '{event.temp_id}', 得分: {event.importance_score:.3f} < {threshold:.3f}"
                     )
+                    logger.debug(f"[{session_id}] 被过滤内容: {event.memory_content}")
 
+            # 最终统计信息
+            logger.info(f"[{session_id}] 🏁 反思存储完成统计:")
+            logger.info(f"[{session_id}] - 总提取事件数: {total_events}")
+            logger.info(f"[{session_id}] - 成功存储数量: {stored_count}")
+            logger.info(f"[{session_id}] - 过滤丢弃数量: {filtered_count}")
+            logger.info(f"[{session_id}] - 存储率: {(stored_count/total_events)*100:.1f}%" if total_events > 0 else f"[{session_id}] - 存储率: 0%")
+            
             if stored_count > 0:
-                logger.info(f"[{session_id}] 成功存储 {stored_count} 个新的记忆事件。")
+                logger.info(f"[{session_id}] ✅ 成功存储 {stored_count} 个新的记忆事件")
             else:
-                logger.info(f"[{session_id}] 没有新的记忆事件达到存储阈值。")
+                logger.warning(f"[{session_id}] ⚠️ 没有记忆事件达到存储阈值 {threshold}，可能需要调整配置")
 
         except Exception as e:
             logger.error(
