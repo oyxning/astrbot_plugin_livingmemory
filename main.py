@@ -29,6 +29,7 @@ from .storage.faiss_manager import FaissManager
 from .core.engines.recall_engine import RecallEngine
 from .core.engines.reflection_engine import ReflectionEngine
 from .core.engines.forgetting_agent import ForgettingAgent
+from .core.retrieval import SparseRetriever
 from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime
 
 # 简易会话管理器，用于跟踪对话历史和轮次
@@ -54,6 +55,7 @@ class LivingMemoryPlugin(Star):
         self.llm_provider: Optional[Provider] = None
         self.db: Optional[FaissVecDB] = None
         self.faiss_manager: Optional[FaissManager] = None
+        self.sparse_retriever: Optional[SparseRetriever] = None
         self.recall_engine: Optional[RecallEngine] = None
         self.reflection_engine: Optional[ReflectionEngine] = None
         self.forgetting_agent: Optional[ForgettingAgent] = None
@@ -83,9 +85,19 @@ class LivingMemoryPlugin(Star):
 
             self.faiss_manager = FaissManager(self.db)
 
+            # 2.5. 初始化稀疏检索器
+            sparse_config = self.config.get("sparse_retriever", {})
+            if sparse_config.get("enabled", True):
+                self.sparse_retriever = SparseRetriever(db_path, sparse_config)
+                await self.sparse_retriever.initialize()
+            else:
+                self.sparse_retriever = None
+
             # 3. 初始化三大核心引擎
             self.recall_engine = RecallEngine(
-                self.config.get("recall_engine", {}), self.faiss_manager
+                self.config.get("recall_engine", {}), 
+                self.faiss_manager,
+                self.sparse_retriever
             )
             self.reflection_engine = ReflectionEngine(
                 self.config.get("reflection_engine", {}),
@@ -367,6 +379,81 @@ class LivingMemoryPlugin(Star):
             await self.context.send_message(
                 event.unified_msg_origin, MessageChain().message(f"遗忘代理任务执行失败: {e}")
             )
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("sparse_rebuild")
+    async def lmem_sparse_rebuild(self, event: AstrMessageEvent):
+        """[管理员] 重建稀疏检索索引。"""
+        if not self.sparse_retriever:
+            yield event.plain_result("稀疏检索器未启用。")
+            return
+
+        yield event.plain_result("正在重建稀疏检索索引...")
+        try:
+            await self.sparse_retriever.rebuild_index()
+            yield event.plain_result("稀疏检索索引重建完成。")
+        except Exception as e:
+            logger.error(f"重建稀疏索引失败: {e}", exc_info=True)
+            yield event.plain_result(f"重建稀疏索引失败: {e}")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("search_mode")
+    async def lmem_search_mode(self, event: AstrMessageEvent, mode: str):
+        """[管理员] 设置检索模式。
+        
+        用法: /lmem search_mode <mode>
+        
+        模式:
+          hybrid - 混合检索（默认）
+          dense - 纯密集检索
+          sparse - 纯稀疏检索
+        """
+        valid_modes = ["hybrid", "dense", "sparse"]
+        if mode not in valid_modes:
+            yield event.plain_result(f"无效的模式，请使用: {', '.join(valid_modes)}")
+            return
+
+        if not self.recall_engine:
+            yield event.plain_result("回忆引擎尚未初始化。")
+            return
+
+        # 更新配置
+        self.recall_engine.config["retrieval_mode"] = mode
+        yield event.plain_result(f"检索模式已设置为: {mode}")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("sparse_test")
+    async def lmem_sparse_test(self, event: AstrMessageEvent, query: str, k: int = 5):
+        """[管理员] 测试稀疏检索功能。"""
+        if not self.sparse_retriever:
+            yield event.plain_result("稀疏检索器未启用。")
+            return
+
+        try:
+            results = await self.sparse_retriever.search(query=query, limit=k)
+            
+            if not results:
+                yield event.plain_result(f"未找到与 '{query}' 相关的记忆。")
+                return
+
+            response_parts = [f"🔍 稀疏检索结果 ({len(results)} 条):"]
+            
+            for i, res in enumerate(results, 1):
+                response_parts.append(f"\n{i}. [ID: {res.doc_id}] Score: {res.score:.3f}")
+                response_parts.append(f"   内容: {res.content[:100]}{'...' if len(res.content) > 100 else ''}")
+                
+                # 显示元数据
+                metadata = res.metadata
+                if metadata.get("event_type"):
+                    response_parts.append(f"   类型: {metadata['event_type']}")
+                if metadata.get("importance"):
+                    response_parts.append(f"   重要性: {metadata['importance']:.2f}")
+
+            yield event.plain_result("\n".join(response_parts))
+
+        except Exception as e:
+            logger.error(f"稀疏检索测试失败: {e}", exc_info=True)
+            yield event.plain_result(f"稀疏检索测试失败: {e}")
 
     @permission_type(PermissionType.ADMIN)
     @lmem_group.command("edit")
