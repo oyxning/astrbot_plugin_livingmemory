@@ -132,17 +132,17 @@ class LivingMemoryPlugin(Star):
                 logger.info(f"成功从配置加载 Embedding Provider: {emb_id}")
 
         if not self.embedding_provider:
-            self.embedding_provider = (
-                self.context.provider_manager.embedding_provider_insts[0]
-            )
-            logger.info(
-                f"未指定 Embedding Provider，使用默认的: {self.embedding_provider.provider_config.get('id')}"
-            )
-
-        if not self.embedding_provider:
-            # 如果没有指定 Embedding Provider，则无法继续
-            self.embedding_provider = None
-            logger.error("未指定 Embedding Provider，插件将无法使用。")
+            # 检查是否有可用的embedding provider
+            embedding_providers = self.context.provider_manager.embedding_provider_insts
+            if embedding_providers:
+                self.embedding_provider = embedding_providers[0]
+                logger.info(
+                    f"未指定 Embedding Provider，使用默认的: {self.embedding_provider.provider_config.get('id')}"
+                )
+            else:
+                # 如果没有可用的embedding provider，则无法继续
+                self.embedding_provider = None
+                logger.error("没有可用的 Embedding Provider，插件将无法使用。")
 
         # 初始化 LLM Provider
         llm_id = self.config.get("provider_settings", {}).get("llm_provider_id")
@@ -262,14 +262,19 @@ class LivingMemoryPlugin(Star):
                 logger.debug(
                     f"正在处理反思任务，session_id: {session_id}, persona_id: {persona_id}"
                 )
-                asyncio.create_task(
-                    self.reflection_engine.reflect_and_store(
-                        conversation_history=history_to_reflect,
-                        session_id=session_id,
-                        persona_id=persona_id,
-                        persona_prompt=persona_prompt,
-                    )
-                )
+                
+                async def reflection_task():
+                    try:
+                        await self.reflection_engine.reflect_and_store(
+                            conversation_history=history_to_reflect,
+                            session_id=session_id,
+                            persona_id=persona_id,
+                            persona_prompt=persona_prompt,
+                        )
+                    except Exception as e:
+                        logger.error(f"反思任务执行失败: {e}", exc_info=True)
+                
+                asyncio.create_task(reflection_task())
 
         except Exception as e:
             logger.error(f"处理 on_llm_response 钩子时发生错误: {e}", exc_info=True)

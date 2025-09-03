@@ -111,10 +111,10 @@ class RecallEngine:
         
         # 处理异常
         if isinstance(dense_results, Exception):
-            logger.error(f"Dense search failed: {dense_results}")
+            logger.error(f"密集检索失败: {dense_results}")
             dense_results = []
         if isinstance(sparse_results, Exception):
-            logger.error(f"Sparse search failed: {sparse_results}")
+            logger.error(f"稀疏检索失败: {sparse_results}")
             sparse_results = []
         
         logger.debug(f"Dense results: {len(dense_results)}, Sparse results: {len(sparse_results)}")
@@ -212,11 +212,13 @@ class RecallEngine:
         current_time = get_now_datetime(context).timestamp()
 
         for res in results:
+            # 安全解析元数据
             metadata = res.data.get("metadata", {})
             if isinstance(metadata, str):
                 try:
                     metadata = json.loads(metadata)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"解析记忆元数据失败: {e}")
                     metadata = {}
 
             # 归一化各项得分 (0-1)

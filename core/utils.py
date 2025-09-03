@@ -36,8 +36,9 @@ async def get_persona_id(context: Context, event: AstrMessageEvent) -> Optional[
             persona_id = default_persona["name"] if default_persona else None
 
         return persona_id
-    except Exception:
+    except Exception as e:
         # 在某些情况下（如无会话），获取可能会失败，返回 None
+        logger.debug(f"获取人格ID失败: {e}")
         return None
 
 
@@ -96,8 +97,9 @@ def format_memories_for_injection(memories: List[Result]) -> str:
 
             entry = f"- [重要性: {importance:.2f}] {content}"
             formatted_entries.append(entry)
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError) as e:
             # 如果元数据解析失败或格式不正确，则跳过此条记忆
+            logger.debug(f"格式化记忆时出错，跳过此记忆: {e}")
             continue
 
     if not formatted_entries:

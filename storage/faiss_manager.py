@@ -150,8 +150,7 @@ class FaissManager:
                     (json.dumps(metadata), doc["id"]),
                 )
             except (json.JSONDecodeError, KeyError) as e:
-                # 记录日志或处理错误
-                print(f"Error updating metadata for doc_id {doc['id']}: {e}")
+                logger.warning(f"更新文档 {doc['id']} 的元数据时出错: {e}")
                 continue
 
         await self.db.document_storage.connection.commit()
@@ -191,14 +190,26 @@ class FaissManager:
             return
 
         # 从 Faiss 中删除
-        self.db.embedding_storage.index.remove_ids(np.array(doc_ids, dtype=np.int64))
-        await self.db.embedding_storage.save_index()
+        try:
+            self.db.embedding_storage.index.remove_ids(np.array(doc_ids, dtype=np.int64))
+            await self.db.embedding_storage.save_index()
+        except Exception as e:
+            logger.error(f"从Faiss索引删除记忆时出错: {e}")
+            # 如果Faiss删除失败，回滚事务
+            await self.db.document_storage.connection.rollback()
+            raise
 
         # 从 SQLite 中删除
-        placeholders = ",".join("?" for _ in doc_ids)
-        sql = f"DELETE FROM documents WHERE id IN ({placeholders})"
-        await self.db.document_storage.connection.execute(sql, doc_ids)
-        await self.db.document_storage.connection.commit()
+        try:
+            placeholders = ",".join("?" for _ in doc_ids)
+            sql = f"DELETE FROM documents WHERE id IN ({placeholders})"
+            await self.db.document_storage.connection.execute(sql, doc_ids)
+            await self.db.document_storage.connection.commit()
+        except Exception as e:
+            logger.error(f"从SQLite删除记忆时出错: {e}")
+            # 如果SQLite删除失败，回滚事务
+            await self.db.document_storage.connection.rollback()
+            raise
 
     async def update_memory(
         self,
@@ -241,11 +252,19 @@ class FaissManager:
                 }
             
             original_doc = docs[0]
-            original_metadata = (
-                json.loads(original_doc["metadata"])
-                if isinstance(original_doc["metadata"], str)
-                else original_doc["metadata"]
-            )
+            try:
+                original_metadata = (
+                    json.loads(original_doc["metadata"])
+                    if isinstance(original_doc["metadata"], str)
+                    else original_doc["metadata"]
+                )
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"解析原始记忆元数据时出错: {e}")
+                return {
+                    "success": False,
+                    "message": f"解析记忆元数据失败: {str(e)}",
+                    "updated_fields": []
+                }
             
             # 准备更新数据
             updated_metadata = original_metadata.copy()

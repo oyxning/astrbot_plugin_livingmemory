@@ -91,7 +91,15 @@ class ForgettingAgent:
         ids_to_delete = []
 
         for mem in all_memories:
-            metadata = json.loads(mem["metadata"])
+            # 安全解析JSON元数据
+            try:
+                if isinstance(mem["metadata"], str):
+                    metadata = json.loads(mem["metadata"])
+                else:
+                    metadata = mem["metadata"]
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"无法解析记忆 {mem['id']} 的元数据: {e}")
+                continue
 
             # 1. 重要性衰减
             create_time = metadata.get("create_time", current_time)
@@ -116,7 +124,9 @@ class ForgettingAgent:
             # 2. 识别待删除项
             retention_seconds = retention_days * 24 * 3600
             is_old = (current_time - create_time) > retention_seconds
-            is_unimportant = metadata["importance"] < 0.1  # 硬编码一个低重要性阈值
+            # 从配置中读取重要性阈值
+            importance_threshold = self.config.get("importance_threshold", 0.1)
+            is_unimportant = metadata["importance"] < importance_threshold
 
             if is_old and is_unimportant:
                 ids_to_delete.append(mem["id"])
