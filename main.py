@@ -30,11 +30,67 @@ from .core.engines.recall_engine import RecallEngine
 from .core.engines.reflection_engine import ReflectionEngine
 from .core.engines.forgetting_agent import ForgettingAgent
 from .core.retrieval import SparseRetriever
-from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime
+from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime, retry_on_failure, OperationContext
+from .core.config_validator import validate_config, merge_config_with_defaults
 
-# 简易会话管理器，用于跟踪对话历史和轮次
-# key: session_id, value: {"history": [], "round_count": 0}
-session_manager = {}
+# 会话管理器类，替代全局字典
+class SessionManager:
+    def __init__(self, max_sessions: int = 1000, session_ttl: int = 3600):
+        """
+        Args:
+            max_sessions: 最大会话数量
+            session_ttl: 会话生存时间（秒）
+        """
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._access_times: Dict[str, float] = {}
+        self.max_sessions = max_sessions
+        self.session_ttl = session_ttl
+        
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        """获取会话数据，如果不存在则创建"""
+        import time
+        current_time = time.time()
+        
+        # 清理过期会话
+        self._cleanup_expired_sessions(current_time)
+        
+        if session_id not in self._sessions:
+            self._sessions[session_id] = {"history": [], "round_count": 0}
+            
+        self._access_times[session_id] = current_time
+        return self._sessions[session_id]
+        
+    def _cleanup_expired_sessions(self, current_time: float):
+        """清理过期的会话"""
+        expired_sessions = []
+        for session_id, last_access in self._access_times.items():
+            if current_time - last_access > self.session_ttl:
+                expired_sessions.append(session_id)
+                
+        for session_id in expired_sessions:
+            self._sessions.pop(session_id, None)
+            self._access_times.pop(session_id, None)
+            
+        # 如果会话数量超过限制，删除最旧的会话
+        if len(self._sessions) > self.max_sessions:
+            # 按访问时间排序，删除最旧的
+            sorted_sessions = sorted(self._access_times.items(), key=lambda x: x[1])
+            sessions_to_remove = sorted_sessions[:len(self._sessions) - self.max_sessions]
+            
+            for session_id, _ in sessions_to_remove:
+                self._sessions.pop(session_id, None)
+                self._access_times.pop(session_id, None)
+                
+    def reset_session(self, session_id: str):
+        """重置指定会话"""
+        import time
+        if session_id in self._sessions:
+            self._sessions[session_id] = {"history": [], "round_count": 0}
+            self._access_times[session_id] = time.time()
+            
+    def get_session_count(self) -> int:
+        """获取当前会话数量"""
+        return len(self._sessions)
 
 
 @register(
@@ -47,8 +103,19 @@ session_manager = {}
 class LivingMemoryPlugin(Star):
     def __init__(self, context: Context, config: Dict[str, Any]):
         super().__init__(context)
-        self.config = config
         self.context = context
+        
+        # 验证和标准化配置
+        try:
+            merged_config = merge_config_with_defaults(config)
+            self.config_obj = validate_config(merged_config)
+            self.config = self.config_obj.dict()  # 保持向后兼容
+            logger.info("插件配置验证成功")
+        except Exception as e:
+            logger.error(f"配置验证失败，使用默认配置: {e}")
+            from .core.config_validator import get_default_config
+            self.config = get_default_config()
+            self.config_obj = validate_config(self.config)
 
         # 初始化状态
         self.embedding_provider: Optional[EmbeddingProvider] = None
@@ -59,9 +126,20 @@ class LivingMemoryPlugin(Star):
         self.recall_engine: Optional[RecallEngine] = None
         self.reflection_engine: Optional[ReflectionEngine] = None
         self.forgetting_agent: Optional[ForgettingAgent] = None
+        
+        # 初始化状态标记
+        self._initialization_complete = False
+        self._initialization_task: Optional[asyncio.Task] = None
+        
+        # 会话管理器
+        session_config = self.config.get("session_manager", {})
+        self.session_manager = SessionManager(
+            max_sessions=session_config.get("max_sessions", 1000),
+            session_ttl=session_config.get("session_ttl", 3600)
+        )
 
         # 启动异步初始化流程
-        asyncio.create_task(self._initialize_plugin())
+        self._initialization_task = asyncio.create_task(self._initialize_plugin())
 
     async def _initialize_plugin(self):
         """
@@ -113,12 +191,41 @@ class LivingMemoryPlugin(Star):
             # 4. 启动后台任务
             await self.forgetting_agent.start()
 
+            # 标记初始化完成
+            self._initialization_complete = True
             logger.info("LivingMemory 插件初始化成功！")
 
         except Exception as e:
             logger.critical(
                 f"LivingMemory 插件初始化过程中发生严重错误: {e}", exc_info=True
             )
+            self._initialization_complete = False
+
+    async def _wait_for_initialization(self, timeout: float = 30.0) -> bool:
+        """
+        等待插件初始化完成。
+        
+        Args:
+            timeout: 超时时间（秒）
+            
+        Returns:
+            bool: 是否初始化成功
+        """
+        if self._initialization_complete:
+            return True
+            
+        if self._initialization_task:
+            try:
+                await asyncio.wait_for(self._initialization_task, timeout=timeout)
+                return self._initialization_complete
+            except asyncio.TimeoutError:
+                logger.error(f"插件初始化超时（{timeout}秒）")
+                return False
+            except Exception as e:
+                logger.error(f"等待插件初始化时发生错误: {e}")
+                return False
+        
+        return False
 
     def _initialize_providers(self):
         """
@@ -159,6 +266,11 @@ class LivingMemoryPlugin(Star):
         """
         [事件钩子] 在 LLM 请求前，查询并注入长期记忆。
         """
+        # 等待初始化完成
+        if not await self._wait_for_initialization():
+            logger.warning("插件未完成初始化，跳过记忆召回。")
+            return
+            
         if not self.recall_engine:
             logger.debug("回忆引擎尚未初始化，跳过记忆召回。")
             return
@@ -169,35 +281,40 @@ class LivingMemoryPlugin(Star):
                     event.unified_msg_origin
                 )
             )
-            # 根据配置决定是否进行过滤
-            filtering_config = self.config.get("filtering_settings", {})
-            use_persona_filtering = filtering_config.get("use_persona_filtering", True)
-            use_session_filtering = filtering_config.get("use_session_filtering", True)
+            
+            async with OperationContext("记忆召回", session_id):
+                # 根据配置决定是否进行过滤
+                filtering_config = self.config.get("filtering_settings", {})
+                use_persona_filtering = filtering_config.get("use_persona_filtering", True)
+                use_session_filtering = filtering_config.get("use_session_filtering", True)
 
-            persona_id = await get_persona_id(self.context, event)
+                persona_id = await get_persona_id(self.context, event)
 
-            recall_session_id = session_id if use_session_filtering else None
-            recall_persona_id = persona_id if use_persona_filtering else None
+                recall_session_id = session_id if use_session_filtering else None
+                recall_persona_id = persona_id if use_persona_filtering else None
 
-            # 使用 RecallEngine 进行智能回忆
-            recalled_memories = await self.recall_engine.recall(
-                self.context, req.prompt, recall_session_id, recall_persona_id
-            )
-
-            if recalled_memories:
-                # 格式化并注入记忆
-                memory_str = format_memories_for_injection(recalled_memories)
-                req.system_prompt = memory_str + "\n" + req.system_prompt
-                logger.info(
-                    f"[{session_id}] 成功向 System Prompt 注入 {len(recalled_memories)} 条记忆。"
+                # 使用 RecallEngine 进行智能回忆，带重试机制
+                recalled_memories = await retry_on_failure(
+                    self.recall_engine.recall,
+                    self.context, req.prompt, recall_session_id, recall_persona_id,
+                    max_retries=1,  # 记忆召回失败影响较小，只重试1次
+                    backoff_factor=0.5,
+                    exceptions=(Exception,)
                 )
 
-            # 管理会话历史
-            if session_id not in session_manager:
-                session_manager[session_id] = {"history": [], "round_count": 0}
-            session_manager[session_id]["history"].append(
-                {"role": "user", "content": req.prompt}
-            )
+                if recalled_memories:
+                    # 格式化并注入记忆
+                    memory_str = format_memories_for_injection(recalled_memories)
+                    req.system_prompt = memory_str + "\n" + req.system_prompt
+                    logger.info(
+                        f"[{session_id}] 成功向 System Prompt 注入 {len(recalled_memories)} 条记忆。"
+                    )
+
+                # 管理会话历史
+                session_data = self.session_manager.get_session(session_id)
+                session_data["history"].append(
+                    {"role": "user", "content": req.prompt}
+                )
 
         except Exception as e:
             logger.error(f"处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
@@ -209,6 +326,11 @@ class LivingMemoryPlugin(Star):
         """
         [事件钩子] 在 LLM 响应后，检查是否需要进行反思和记忆存储。
         """
+        # 等待初始化完成
+        if not await self._wait_for_initialization():
+            logger.warning("插件未完成初始化，跳过记忆反思。")
+            return
+            
         if not self.reflection_engine or resp.role != "assistant":
             logger.debug("反思引擎尚未初始化或响应不是助手角色，跳过反思。")
             return
@@ -219,11 +341,11 @@ class LivingMemoryPlugin(Star):
                     event.unified_msg_origin
                 )
             )
-            if not session_id or session_id not in session_manager:
+            if not session_id:
                 return
 
             # 添加助手响应到历史并增加轮次计数
-            current_session = session_manager[session_id]
+            current_session = self.session_manager.get_session(session_id)
             current_session["history"].append(
                 {"role": "assistant", "content": resp.completion_text}
             )
@@ -243,7 +365,7 @@ class LivingMemoryPlugin(Star):
 
                 history_to_reflect = list(current_session["history"])
                 # 重置会话
-                session_manager[session_id] = {"history": [], "round_count": 0}
+                self.session_manager.reset_session(session_id)
 
                 persona_id = await get_persona_id(self.context, event)
 
@@ -264,15 +386,21 @@ class LivingMemoryPlugin(Star):
                 )
                 
                 async def reflection_task():
-                    try:
-                        await self.reflection_engine.reflect_and_store(
-                            conversation_history=history_to_reflect,
-                            session_id=session_id,
-                            persona_id=persona_id,
-                            persona_prompt=persona_prompt,
-                        )
-                    except Exception as e:
-                        logger.error(f"反思任务执行失败: {e}", exc_info=True)
+                    async with OperationContext("记忆反思", session_id):
+                        try:
+                            # 使用重试机制执行反思
+                            await retry_on_failure(
+                                self.reflection_engine.reflect_and_store,
+                                conversation_history=history_to_reflect,
+                                session_id=session_id,
+                                persona_id=persona_id,
+                                persona_prompt=persona_prompt,
+                                max_retries=2,  # 重试2次
+                                backoff_factor=1.0,
+                                exceptions=(Exception,)  # 捕获所有异常重试
+                            )
+                        except Exception as e:
+                            logger.error(f"[{session_id}] 反思任务最终失败: {e}", exc_info=True)
                 
                 asyncio.create_task(reflection_task())
 
@@ -675,6 +803,72 @@ class LivingMemoryPlugin(Star):
         except Exception as e:
             logger.error(f"查看记忆历史时发生错误: {e}", exc_info=True)
             yield event.plain_result(f"查看记忆历史时发生错误: {e}")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("config")
+    async def lmem_config(self, event: AstrMessageEvent, action: str = "show"):
+        """[管理员] 查看或验证配置。
+        
+        用法: /lmem config [show|validate]
+        
+        动作:
+          show - 显示当前配置
+          validate - 验证配置有效性
+        """
+        if action == "show":
+            try:
+                # 显示主要配置项
+                config_summary = []
+                config_summary.append("📋 LivingMemory 配置摘要:")
+                config_summary.append("")
+                
+                # 会话管理器配置
+                sm_config = self.config.get("session_manager", {})
+                config_summary.append(f"🗂️ 会话管理:")
+                config_summary.append(f"  - 最大会话数: {sm_config.get('max_sessions', 1000)}")
+                config_summary.append(f"  - 会话TTL: {sm_config.get('session_ttl', 3600)}秒")
+                config_summary.append(f"  - 当前会话数: {self.session_manager.get_session_count()}")
+                config_summary.append("")
+                
+                # 回忆引擎配置
+                re_config = self.config.get("recall_engine", {})
+                config_summary.append(f"🧠 回忆引擎:")
+                config_summary.append(f"  - 检索模式: {re_config.get('retrieval_mode', 'hybrid')}")
+                config_summary.append(f"  - 返回数量: {re_config.get('top_k', 5)}")
+                config_summary.append(f"  - 召回策略: {re_config.get('recall_strategy', 'weighted')}")
+                config_summary.append("")
+                
+                # 反思引擎配置
+                rf_config = self.config.get("reflection_engine", {})
+                config_summary.append(f"💭 反思引擎:")
+                config_summary.append(f"  - 触发轮次: {rf_config.get('summary_trigger_rounds', 10)}")
+                config_summary.append(f"  - 重要性阈值: {rf_config.get('importance_threshold', 0.5)}")
+                config_summary.append("")
+                
+                # 遗忘代理配置
+                fa_config = self.config.get("forgetting_agent", {})
+                config_summary.append(f"🗑️ 遗忘代理:")
+                config_summary.append(f"  - 启用状态: {'是' if fa_config.get('enabled', True) else '否'}")
+                config_summary.append(f"  - 检查间隔: {fa_config.get('check_interval_hours', 24)}小时")
+                config_summary.append(f"  - 保留天数: {fa_config.get('retention_days', 90)}天")
+                
+                yield event.plain_result("\n".join(config_summary))
+                
+            except Exception as e:
+                yield event.plain_result(f"显示配置时发生错误: {e}")
+                
+        elif action == "validate":
+            try:
+                from .core.config_validator import validate_config
+                # 重新验证当前配置
+                validate_config(self.config)
+                yield event.plain_result("✅ 配置验证通过，所有参数均有效")
+                
+            except Exception as e:
+                yield event.plain_result(f"❌ 配置验证失败: {e}")
+                
+        else:
+            yield event.plain_result("❌ 无效的动作，请使用 'show' 或 'validate'")
 
     async def terminate(self):
         """

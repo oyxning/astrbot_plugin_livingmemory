@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Union
 import numpy as np
 
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB, Result
+from ..core.utils import safe_parse_metadata, safe_serialize_metadata, validate_timestamp
 
 
 class FaissManager:
@@ -137,19 +138,16 @@ class FaissManager:
 
         for doc in docs:
             try:
-                metadata = (
-                    json.loads(doc["metadata"])
-                    if isinstance(doc["metadata"], str)
-                    else doc["metadata"]
-                )
+                # 使用统一的元数据处理函数
+                metadata = safe_parse_metadata(doc["metadata"])
                 metadata["last_access_time"] = current_timestamp
 
                 # 更新数据库
                 await self.db.document_storage.connection.execute(
                     "UPDATE documents SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata), doc["id"]),
+                    (safe_serialize_metadata(metadata), doc["id"]),
                 )
-            except (json.JSONDecodeError, KeyError) as e:
+            except Exception as e:
                 logger.warning(f"更新文档 {doc['id']} 的元数据时出错: {e}")
                 continue
 
@@ -158,11 +156,69 @@ class FaissManager:
     async def get_all_memories_for_forgetting(self) -> List[Dict[str, Any]]:
         """
         获取所有记忆及其元数据，用于遗忘代理的处理。
-
+        
+        注意：此方法仅为向后兼容保留，新代码应使用 get_memories_paginated
+        
         Returns:
             List[Dict[str, Any]]: 包含所有记忆数据的列表。
         """
         return await self.db.document_storage.get_documents(metadata_filters={})
+    
+    async def get_memories_paginated(
+        self, 
+        page_size: int = 1000, 
+        offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """
+        分页获取记忆数据，避免一次性加载大量数据。
+        
+        Args:
+            page_size: 每页记录数
+            offset: 偏移量
+            
+        Returns:
+            List[Dict[str, Any]]: 分页记忆数据
+        """
+        try:
+            # 使用 SQLite 的 LIMIT 和 OFFSET 进行分页
+            async with self.db.document_storage.connection.execute(
+                "SELECT * FROM documents ORDER BY id LIMIT ? OFFSET ?",
+                (page_size, offset)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                
+            # 转换为字典格式
+            memories = []
+            for row in rows:
+                memory = {
+                    "id": row[0],  # id 列
+                    "content": row[1],  # content 列
+                    "metadata": row[2] if row[2] else "{}"  # metadata 列
+                }
+                memories.append(memory)
+                
+            return memories
+            
+        except Exception as e:
+            logger.error(f"分页获取记忆失败: {e}")
+            return []
+    
+    async def count_total_memories(self) -> int:
+        """
+        获取记忆总数。
+        
+        Returns:
+            int: 记忆总数
+        """
+        try:
+            async with self.db.document_storage.connection.execute(
+                "SELECT COUNT(*) FROM documents"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"获取记忆总数失败: {e}")
+            return 0
 
     async def update_memories_metadata(self, memories: List[Dict[str, Any]]):
         """
@@ -175,13 +231,13 @@ class FaissManager:
             for mem in memories:
                 await cursor.execute(
                     "UPDATE documents SET metadata = ? WHERE id = ?",
-                    (json.dumps(mem["metadata"]), mem["id"]),
+                    (safe_serialize_metadata(mem["metadata"]), mem["id"]),
                 )
         await self.db.document_storage.connection.commit()
 
     async def delete_memories(self, doc_ids: List[int]):
         """
-        批量删除一组记忆。
+        批量删除一组记忆，使用事务确保数据一致性。
 
         Args:
             doc_ids (List[int]): 需要删除的文档 ID 列表。
@@ -189,27 +245,36 @@ class FaissManager:
         if not doc_ids:
             return
 
-        # 从 Faiss 中删除
+        # 开始事务
+        await self.db.document_storage.connection.execute("BEGIN")
+        
+        faiss_deleted = False
         try:
-            self.db.embedding_storage.index.remove_ids(np.array(doc_ids, dtype=np.int64))
-            await self.db.embedding_storage.save_index()
-        except Exception as e:
-            logger.error(f"从Faiss索引删除记忆时出错: {e}")
-            # 如果Faiss删除失败，回滚事务
-            await self.db.document_storage.connection.rollback()
-            raise
-
-        # 从 SQLite 中删除
-        try:
+            # 首先从 SQLite 中删除（更容易回滚）
             placeholders = ",".join("?" for _ in doc_ids)
             sql = f"DELETE FROM documents WHERE id IN ({placeholders})"
             await self.db.document_storage.connection.execute(sql, doc_ids)
+            
+            # 然后从 Faiss 索引中删除
+            self.db.embedding_storage.index.remove_ids(np.array(doc_ids, dtype=np.int64))
+            await self.db.embedding_storage.save_index()
+            faiss_deleted = True
+            
+            # 提交事务
             await self.db.document_storage.connection.commit()
+            logger.info(f"成功删除 {len(doc_ids)} 条记忆")
+            
         except Exception as e:
-            logger.error(f"从SQLite删除记忆时出错: {e}")
-            # 如果SQLite删除失败，回滚事务
+            logger.error(f"删除记忆时发生错误: {e}")
+            
+            # 回滚SQLite事务
             await self.db.document_storage.connection.rollback()
-            raise
+            
+            # 如果Faiss已经删除但SQLite失败，需要恢复Faiss（这是不完美的，但比数据不一致好）
+            if faiss_deleted:
+                logger.warning("Faiss索引已删除但SQLite回滚，数据可能不一致。建议重建索引。")
+            
+            raise RuntimeError(f"删除记忆失败: {e}") from e
 
     async def update_memory(
         self,
