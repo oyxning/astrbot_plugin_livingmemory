@@ -36,12 +36,22 @@ class RecallEngineConfig(BaseModel):
 
 class FusionConfig(BaseModel):
     """结果融合配置"""
-    strategy: str = Field(default="rrf", regex="^(rrf|weighted|linear)$", description="融合策略")
+    strategy: str = Field(
+        default="rrf", 
+        regex="^(rrf|weighted|cascade|adaptive|convex|interleave|rank_fusion|score_fusion|hybrid_rrf)$", 
+        description="融合策略"
+    )
     rrf_k: int = Field(default=60, ge=1, le=1000, description="RRF参数k")
     dense_weight: float = Field(default=0.7, ge=0.0, le=1.0, description="密集检索权重")
     sparse_weight: float = Field(default=0.3, ge=0.0, le=1.0, description="稀疏检索权重")
     sparse_alpha: float = Field(default=1.0, ge=0.1, le=10.0, description="稀疏分数缩放")
     sparse_epsilon: float = Field(default=0.0, ge=0.0, le=1.0, description="稀疏分数偏移")
+    
+    # 新增参数
+    convex_lambda: float = Field(default=0.5, ge=0.0, le=1.0, description="凸组合参数λ")
+    interleave_ratio: float = Field(default=0.5, ge=0.0, le=1.0, description="交替融合比例")
+    rank_bias_factor: float = Field(default=0.1, ge=0.0, le=1.0, description="排序偏置因子")
+    diversity_bonus: float = Field(default=0.1, ge=0.0, le=1.0, description="多样性奖励")
 
 
 class ReflectionEngineConfig(BaseModel):

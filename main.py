@@ -30,7 +30,7 @@ from .core.engines.recall_engine import RecallEngine
 from .core.engines.reflection_engine import ReflectionEngine
 from .core.engines.forgetting_agent import ForgettingAgent
 from .core.retrieval import SparseRetriever
-from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime, retry_on_failure, OperationContext
+from .core.utils import get_persona_id, format_memories_for_injection, get_now_datetime, retry_on_failure, OperationContext, safe_parse_metadata
 from .core.config_validator import validate_config, merge_config_with_defaults
 
 # 会话管理器类，替代全局字典
@@ -869,6 +869,185 @@ class LivingMemoryPlugin(Star):
                 
         else:
             yield event.plain_result("❌ 无效的动作，请使用 'show' 或 'validate'")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("fusion")
+    async def lmem_fusion(self, event: AstrMessageEvent, strategy: str = "show", param: str = ""):
+        """[管理员] 管理检索融合策略。
+        
+        用法: /lmem fusion [strategy] [param=value]
+        
+        策略:
+          show - 显示当前融合配置
+          rrf - Reciprocal Rank Fusion (经典RRF)
+          hybrid_rrf - 混合RRF (动态调整参数)
+          weighted - 加权融合
+          convex - 凸组合融合
+          interleave - 交替融合
+          rank_fusion - 基于排序的融合
+          score_fusion - 基于分数的融合 (Borda Count)
+          cascade - 级联融合
+          adaptive - 自适应融合
+          
+        示例:
+          /lmem fusion show
+          /lmem fusion hybrid_rrf
+          /lmem fusion convex lambda=0.6
+          /lmem fusion weighted dense_weight=0.8
+        """
+        if not self.recall_engine:
+            yield event.plain_result("❌ 回忆引擎尚未初始化。")
+            return
+        
+        if strategy == "show":
+            # 显示当前融合配置
+            fusion_config = self.config.get("fusion", {})
+            current_strategy = fusion_config.get("strategy", "rrf")
+            
+            response = ["🔄 当前检索融合配置:"]
+            response.append(f"策略: {current_strategy}")
+            response.append("")
+            
+            if current_strategy in ["rrf", "hybrid_rrf"]:
+                response.append(f"RRF参数k: {fusion_config.get('rrf_k', 60)}")
+                if current_strategy == "hybrid_rrf":
+                    response.append(f"多样性奖励: {fusion_config.get('diversity_bonus', 0.1)}")
+            
+            if current_strategy in ["weighted", "convex", "rank_fusion", "score_fusion"]:
+                response.append(f"密集权重: {fusion_config.get('dense_weight', 0.7)}")
+                response.append(f"稀疏权重: {fusion_config.get('sparse_weight', 0.3)}")
+            
+            if current_strategy == "convex":
+                response.append(f"凸组合λ: {fusion_config.get('convex_lambda', 0.5)}")
+            
+            if current_strategy == "interleave":
+                response.append(f"交替比例: {fusion_config.get('interleave_ratio', 0.5)}")
+            
+            if current_strategy == "rank_fusion":
+                response.append(f"排序偏置: {fusion_config.get('rank_bias_factor', 0.1)}")
+            
+            response.append("")
+            response.append("💡 各策略特点:")
+            response.append("• rrf: 经典方法，平衡性好")
+            response.append("• hybrid_rrf: 动态调整，适应查询类型")
+            response.append("• weighted: 简单加权，可解释性强")
+            response.append("• convex: 凸组合，数学严格")
+            response.append("• interleave: 交替选择，保证多样性")
+            response.append("• rank_fusion: 基于排序位置")
+            response.append("• score_fusion: Borda Count投票")
+            response.append("• cascade: 稀疏初筛+密集精排")
+            response.append("• adaptive: 根据查询自适应")
+            
+            yield event.plain_result("\n".join(response))
+            
+        elif strategy in ["rrf", "hybrid_rrf", "weighted", "convex", "interleave", 
+                         "rank_fusion", "score_fusion", "cascade", "adaptive"]:
+            
+            # 更新融合策略
+            if "fusion" not in self.config:
+                self.config["fusion"] = {}
+            
+            old_strategy = self.config["fusion"].get("strategy", "rrf")
+            self.config["fusion"]["strategy"] = strategy
+            
+            # 处理参数
+            if param and "=" in param:
+                key, value = param.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                try:
+                    # 尝试转换为数字
+                    if "." in value:
+                        self.config["fusion"][key] = float(value)
+                    else:
+                        self.config["fusion"][key] = int(value)
+                        
+                    logger.info(f"更新融合参数 {key} = {value}")
+                except ValueError:
+                    yield event.plain_result(f"❌ 参数值无效: {value}")
+                    return
+            
+            # 更新 RecallEngine 中的融合配置
+            if hasattr(self.recall_engine, 'result_fusion'):
+                self.recall_engine.result_fusion.strategy = strategy
+                self.recall_engine.result_fusion.config = self.config["fusion"]
+                
+                # 更新融合器的参数
+                fusion_obj = self.recall_engine.result_fusion
+                fusion_obj.dense_weight = self.config["fusion"].get("dense_weight", 0.7)
+                fusion_obj.sparse_weight = self.config["fusion"].get("sparse_weight", 0.3)
+                fusion_obj.rrf_k = self.config["fusion"].get("rrf_k", 60)
+                fusion_obj.convex_lambda = self.config["fusion"].get("convex_lambda", 0.5)
+                fusion_obj.interleave_ratio = self.config["fusion"].get("interleave_ratio", 0.5)
+                fusion_obj.rank_bias_factor = self.config["fusion"].get("rank_bias_factor", 0.1)
+            
+            yield event.plain_result(f"✅ 融合策略已从 '{old_strategy}' 更新为 '{strategy}'{f' (参数: {param})' if param else ''}")
+            
+        else:
+            yield event.plain_result("❌ 不支持的融合策略。使用 /lmem fusion show 查看可用选项。")
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem_group.command("test_fusion")
+    async def lmem_test_fusion(self, event: AstrMessageEvent, query: str, k: int = 5):
+        """[管理员] 测试不同融合策略的效果。
+        
+        用法: /lmem test_fusion <查询> [返回数量]
+        
+        这个命令会使用当前的融合策略进行搜索，并显示详细的融合过程信息。
+        """
+        if not self.recall_engine:
+            yield event.plain_result("❌ 回忆引擎尚未初始化。")
+            return
+        
+        try:
+            yield event.plain_result(f"🔍 测试融合策略，查询: '{query}', 返回数量: {k}")
+            
+            # 执行搜索
+            session_id = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            persona_id = await get_persona_id(self.context, event)
+            
+            results = await self.recall_engine.recall(
+                self.context, query, session_id, persona_id, k
+            )
+            
+            if not results:
+                yield event.plain_result("📭 未找到相关记忆。")
+                return
+            
+            # 获取融合配置
+            fusion_config = self.config.get("fusion", {})
+            current_strategy = fusion_config.get("strategy", "rrf")
+            
+            response = [f"🎯 融合测试结果 (策略: {current_strategy})"]
+            response.append("=" * 50)
+            
+            for i, result in enumerate(results, 1):
+                # 解析元数据
+                metadata = safe_parse_metadata(result.data.get("metadata", {}))
+                importance = metadata.get("importance", 0.0)
+                event_type = metadata.get("event_type", "未知")
+                
+                response.append(f"\n{i}. [ID: {result.data['id']}] 分数: {result.similarity:.4f}")
+                response.append(f"   重要性: {importance:.3f} | 类型: {event_type}")
+                response.append(f"   内容: {result.data['text'][:100]}{'...' if len(result.data['text']) > 100 else ''}")
+            
+            response.append("\n" + "=" * 50)
+            response.append(f"💡 当前融合配置:")
+            response.append(f"   策略: {current_strategy}")
+            if current_strategy in ["rrf", "hybrid_rrf"]:
+                response.append(f"   RRF-k: {fusion_config.get('rrf_k', 60)}")
+            if current_strategy in ["weighted", "convex"]:
+                response.append(f"   密集权重: {fusion_config.get('dense_weight', 0.7)}")
+                response.append(f"   稀疏权重: {fusion_config.get('sparse_weight', 0.3)}")
+            
+            yield event.plain_result("\n".join(response))
+            
+        except Exception as e:
+            logger.error(f"融合策略测试失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 测试失败: {e}")
 
     async def terminate(self):
         """
