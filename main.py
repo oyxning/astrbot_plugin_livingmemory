@@ -7,6 +7,7 @@ main.py - LivingMemory 插件主文件
 import asyncio
 import os
 import json
+import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
@@ -48,7 +49,6 @@ class SessionManager:
         
     def get_session(self, session_id: str) -> Dict[str, Any]:
         """获取会话数据，如果不存在则创建"""
-        import time
         current_time = time.time()
         
         # 清理过期会话
@@ -83,7 +83,6 @@ class SessionManager:
                 
     def reset_session(self, session_id: str):
         """重置指定会话"""
-        import time
         if session_id in self._sessions:
             self._sessions[session_id] = {"history": [], "round_count": 0}
             self._access_times[session_id] = time.time()
@@ -438,7 +437,10 @@ class LivingMemoryPlugin(Star):
             return
 
         response_parts = [f"为您找到 {len(results)} 条相关记忆："]
-        tz = get_now_datetime(self.context).tzinfo  # 获取当前时区
+        # 获取时区配置
+        tz_config = self.config.get("timezone_settings", {})
+        tz_str = tz_config.get("timezone", "Asia/Shanghai")
+        tz = get_now_datetime(tz_str).tzinfo  # 获取当前时区
 
         for res in results:
             metadata = res.data.get("metadata", {})
@@ -502,16 +504,11 @@ class LivingMemoryPlugin(Star):
 
         yield event.plain_result("正在后台手动触发遗忘代理任务...")
         try:
-            logger.debug("1")
             await self.forgetting_agent._prune_memories()
-            await self.context.send_message(
-                event.unified_msg_origin, MessageChain().message("遗忘代理任务执行完毕。")
-            )
+            yield event.plain_result("遗忘代理任务执行完毕。")
         except Exception as e:
             logger.error(f"遗忘代理任务执行失败: {e}", exc_info=True)
-            await self.context.send_message(
-                event.unified_msg_origin, MessageChain().message(f"遗忘代理任务执行失败: {e}")
-            )
+            yield event.plain_result(f"遗忘代理任务执行失败: {e}")
 
     @permission_type(PermissionType.ADMIN)
     @lmem_group.command("sparse_rebuild")
@@ -679,11 +676,11 @@ class LivingMemoryPlugin(Star):
     @permission_type(PermissionType.ADMIN)
     @lmem_group.command("update")
     async def lmem_update(self, event: AstrMessageEvent, memory_id: str):
-        """[管理员] 交互式编辑记忆。
+        """[管理员] 查看记忆详细信息并提供编辑指引。
         
         用法: /lmem update <id>
         
-        会引导你逐步选择要更新的字段。
+        显示记忆的完整信息，并指引如何使用编辑命令。
         """
         if not self.faiss_manager:
             yield event.plain_result("记忆库尚未初始化。")
@@ -710,24 +707,74 @@ class LivingMemoryPlugin(Star):
                 else doc["metadata"]
             )
 
-            # 显示当前记忆信息
-            response = f"📝 记忆 {memory_id} 的当前信息:\n\n"
-            response += f"内容: {doc['content'][:100]}{'...' if len(doc['content']) > 100 else ''}\n\n"
-            response += f"重要性: {metadata.get('importance', 'N/A')}\n"
-            response += f"类型: {metadata.get('event_type', 'N/A')}\n"
-            response += f"状态: {metadata.get('status', 'active')}\n\n"
-            response += "请回复要更新的字段编号:\n"
-            response += "1. 内容\n"
-            response += "2. 重要性\n"
-            response += "3. 事件类型\n"
-            response += "4. 状态\n"
-            response += "0. 取消"
+            # 显示完整记忆信息
+            response_parts = [f"📝 记忆 {memory_id} 的详细信息:"]
+            response_parts.append("=" * 50)
+            
+            # 内容
+            response_parts.append(f"\n📄 内容:")
+            response_parts.append(f"{doc['content']}")
+            
+            # 基本信息
+            response_parts.append(f"\n📊 基本信息:")
+            response_parts.append(f"- ID: {memory_id}")
+            response_parts.append(f"- 重要性: {metadata.get('importance', 'N/A')}")
+            response_parts.append(f"- 类型: {metadata.get('event_type', 'N/A')}")
+            response_parts.append(f"- 状态: {metadata.get('status', 'active')}")
+            
+            # 时间信息
+            tz_config = self.config.get("timezone_settings", {})
+            tz_str = tz_config.get("timezone", "Asia/Shanghai")
+            tz = get_now_datetime(tz_str).tzinfo
+            
+            create_time = metadata.get('create_time')
+            if create_time:
+                dt = datetime.fromtimestamp(create_time, tz=timezone.utc)
+                dt_local = dt.astimezone(tz)
+                response_parts.append(f"- 创建时间: {dt_local.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            last_access_time = metadata.get('last_access_time')
+            if last_access_time:
+                dt = datetime.fromtimestamp(last_access_time, tz=timezone.utc)
+                dt_local = dt.astimezone(tz)
+                response_parts.append(f"- 最后访问: {dt_local.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 更新历史
+            update_history = metadata.get('update_history', [])
+            if update_history:
+                response_parts.append(f"\n🔄 更新历史 ({len(update_history)} 次):")
+                for i, update in enumerate(update_history[-3:], 1):  # 只显示最近3次
+                    timestamp = update.get('timestamp')
+                    if timestamp:
+                        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                        dt_local = dt.astimezone(tz)
+                        time_str = dt_local.strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        time_str = "未知"
+                    
+                    response_parts.append(f"\n{i}. {time_str}")
+                    response_parts.append(f"   原因: {update.get('reason', 'N/A')}")
+                    response_parts.append(f"   字段: {', '.join(update.get('fields', []))}")
+            
+            # 编辑指引
+            response_parts.append(f"\n" + "=" * 50)
+            response_parts.append(f"\n🛠️ 编辑指引:")
+            response_parts.append(f"使用以下命令编辑此记忆:")
+            response_parts.append(f"\n• 编辑内容:")
+            response_parts.append(f"  /lmem edit {memory_id} content <新内容> [原因]")
+            response_parts.append(f"\n• 编辑重要性:")
+            response_parts.append(f"  /lmem edit {memory_id} importance <0.0-1.0> [原因]")
+            response_parts.append(f"\n• 编辑类型:")
+            response_parts.append(f"  /lmem edit {memory_id} type <FACT/PREFERENCE/GOAL/OPINION/RELATIONSHIP/OTHER> [原因]")
+            response_parts.append(f"\n• 编辑状态:")
+            response_parts.append(f"  /lmem edit {memory_id} status <active/archived/deleted> [原因]")
+            
+            # 示例
+            response_parts.append(f"\n💡 示例:")
+            response_parts.append(f"  /lmem edit {memory_id} importance 0.9 提高重要性评分")
+            response_parts.append(f"  /lmem edit {memory_id} type PREFERENCE 重新分类为偏好")
 
-            yield event.plain_result(response)
-
-            # 这里应该等待用户回复，但由于命令系统的限制，
-            # 我们只能引导用户使用 /lmem edit 命令
-            yield event.plain_result(f"\n请使用 /lmem edit {memory_id} <字段> <值> [原因] 来更新记忆")
+            yield event.plain_result("\n".join(response_parts))
 
         except Exception as e:
             logger.error(f"查看记忆时发生错误: {e}", exc_info=True)
@@ -772,7 +819,9 @@ class LivingMemoryPlugin(Star):
             response_parts.append(f"- 状态: {metadata.get('status', 'active')}")
             
             # 时间信息
-            tz = get_now_datetime(self.context).tzinfo
+            tz_config = self.config.get("timezone_settings", {})
+            tz_str = tz_config.get("timezone", "Asia/Shanghai")
+            tz = get_now_datetime(tz_str).tzinfo
             create_time = metadata.get('create_time')
             if create_time:
                 dt = datetime.fromtimestamp(create_time, tz=timezone.utc)
@@ -952,35 +1001,108 @@ class LivingMemoryPlugin(Star):
             
             # 处理参数
             if param and "=" in param:
-                key, value = param.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                
                 try:
-                    # 尝试转换为数字
-                    if "." in value:
-                        self.config["fusion"][key] = float(value)
-                    else:
-                        self.config["fusion"][key] = int(value)
+                    key, value = param.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # 验证参数名
+                    valid_params = {
+                        "dense_weight", "sparse_weight", "rrf_k", "convex_lambda",
+                        "interleave_ratio", "rank_bias_factor", "diversity_bonus"
+                    }
+                    
+                    if key not in valid_params:
+                        yield event.plain_result(f"❌ 无效的参数名: {key}。支持的参数: {', '.join(sorted(valid_params))}")
+                        return
+                    
+                    # 验证参数值
+                    try:
+                        if key in ["dense_weight", "sparse_weight", "convex_lambda", "interleave_ratio", "rank_bias_factor", "diversity_bonus"]:
+                            param_value = float(value)
+                        else:
+                            param_value = int(value)
+                    except ValueError:
+                        yield event.plain_result(f"❌ 参数 {key} 的值类型无效: {value}")
+                        return
+                    
+                    # 参数范围和约束检查
+                    param_constraints = {
+                        "dense_weight": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "sparse_weight": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "convex_lambda": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "interleave_ratio": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "rank_bias_factor": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "diversity_bonus": (0.0, 1.0, "必须在 0.0-1.0 范围内"),
+                        "rrf_k": (1, 1000, "必须是正整数")
+                    }
+                    
+                    if key in param_constraints:
+                        min_val, max_val, error_msg = param_constraints[key]
+                        if not min_val <= param_value <= max_val:
+                            yield event.plain_result(f"❌ 参数 {key} {error_msg}")
+                            return
+                    
+                    # 策略特定参数验证
+                    strategy_params = {
+                        "rrf": ["rrf_k"],
+                        "hybrid_rrf": ["rrf_k", "diversity_bonus"],
+                        "weighted": ["dense_weight", "sparse_weight"],
+                        "convex": ["dense_weight", "sparse_weight", "convex_lambda"],
+                        "interleave": ["interleave_ratio"],
+                        "rank_fusion": ["dense_weight", "sparse_weight", "rank_bias_factor"],
+                        "score_fusion": ["dense_weight", "sparse_weight"],
+                        "cascade": ["dense_weight", "sparse_weight"],
+                        "adaptive": ["dense_weight", "sparse_weight"]
+                    }
+                    
+                    if strategy in strategy_params and key not in strategy_params[strategy]:
+                        yield event.plain_result(f"❌ 参数 {key} 不适用于策略 {strategy}")
+                        return
+                    
+                    # 权重和检查（对于需要权重的策略）
+                    if key in ["dense_weight", "sparse_weight"]:
+                        other_key = "sparse_weight" if key == "dense_weight" else "dense_weight"
+                        other_value = self.config["fusion"].get(other_key, 0.3 if other_key == "sparse_weight" else 0.7)
                         
-                    logger.info(f"更新融合参数 {key} = {value}")
-                except ValueError:
-                    yield event.plain_result(f"❌ 参数值无效: {value}")
+                        # 如果设置了新的权重，检查和是否超过1.0
+                        if key + other_key in [k for k in strategy_params.get(strategy, []) if k in ["dense_weight", "sparse_weight"]]:
+                            total_weight = param_value + other_value
+                            if total_weight > 1.0:
+                                yield event.plain_result(f"❌ 权重总和不能超过 1.0 (当前总和: {total_weight:.2f})")
+                                return
+                    
+                    self.config["fusion"][key] = param_value
+                    logger.info(f"更新融合参数 {key} = {param_value}")
+                    
+                except Exception as e:
+                    yield event.plain_result(f"❌ 参数解析错误: {e}")
                     return
             
             # 更新 RecallEngine 中的融合配置
-            if hasattr(self.recall_engine, 'result_fusion'):
-                self.recall_engine.result_fusion.strategy = strategy
-                self.recall_engine.result_fusion.config = self.config["fusion"]
-                
-                # 更新融合器的参数
-                fusion_obj = self.recall_engine.result_fusion
-                fusion_obj.dense_weight = self.config["fusion"].get("dense_weight", 0.7)
-                fusion_obj.sparse_weight = self.config["fusion"].get("sparse_weight", 0.3)
-                fusion_obj.rrf_k = self.config["fusion"].get("rrf_k", 60)
-                fusion_obj.convex_lambda = self.config["fusion"].get("convex_lambda", 0.5)
-                fusion_obj.interleave_ratio = self.config["fusion"].get("interleave_ratio", 0.5)
-                fusion_obj.rank_bias_factor = self.config["fusion"].get("rank_bias_factor", 0.1)
+            try:
+                if hasattr(self.recall_engine, 'result_fusion'):
+                    self.recall_engine.update_fusion_config(strategy, self.config["fusion"])
+                else:
+                    logger.warning("RecallEngine 没有 result_fusion 属性，跳过更新")
+            except AttributeError:
+                # 如果 RecallEngine 没有 update_fusion_config 方法，则直接更新属性
+                if hasattr(self.recall_engine, 'result_fusion'):
+                    fusion_obj = self.recall_engine.result_fusion
+                    fusion_obj.strategy = strategy
+                    fusion_obj.config = self.config["fusion"]
+                    
+                    # 更新融合器的参数
+                    fusion_obj.dense_weight = self.config["fusion"].get("dense_weight", 0.7)
+                    fusion_obj.sparse_weight = self.config["fusion"].get("sparse_weight", 0.3)
+                    fusion_obj.rrf_k = self.config["fusion"].get("rrf_k", 60)
+                    fusion_obj.convex_lambda = self.config["fusion"].get("convex_lambda", 0.5)
+                    fusion_obj.interleave_ratio = self.config["fusion"].get("interleave_ratio", 0.5)
+                    fusion_obj.rank_bias_factor = self.config["fusion"].get("rank_bias_factor", 0.1)
+            except Exception as e:
+                logger.error(f"更新融合配置时出错: {e}")
+                yield event.plain_result(f"⚠️ 配置已更新，但引擎同步可能失败: {e}")
+                return
             
             yield event.plain_result(f"✅ 融合策略已从 '{old_strategy}' 更新为 '{strategy}'{f' (参数: {param})' if param else ''}")
             
