@@ -151,11 +151,8 @@ class SparseRetriever:
                 tokens = jieba.cut_for_search(query)
                 query = " ".join(tokens)
         
-        # FTS5 查询语法转义
-        escape_chars = '-()"\\"'
-        for char in escape_chars:
-            query = query.replace(char, f'\\{char}')
-        
+        query = query.replace('"', ' ') # 将内部的双引号替换为空格
+
         return query
     
     async def search(
