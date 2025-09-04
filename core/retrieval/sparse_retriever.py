@@ -98,6 +98,10 @@ class FTSManager:
     async def search(self, query: str, limit: int = 50) -> List[Tuple[int, float]]:
         """执行 BM25 搜索"""
         async with aiosqlite.connect(self.db_path) as db:
+            # 将整个查询用双引号包裹，以处理特殊字符并将其作为短语搜索
+            # 这是为了防止 FTS5 语法错误，例如 'syntax error near "."'
+            safe_query = f'"{query}"'
+
             # 使用 BM25 算法搜索
             cursor = await db.execute(f"""
                 SELECT doc_id, bm25({self.fts_table_name}) as score 
@@ -105,7 +109,7 @@ class FTSManager:
                 WHERE {self.fts_table_name} MATCH ?
                 ORDER BY score
                 LIMIT ?
-            """, (query, limit))
+            """, (safe_query, limit))
             
             results = await cursor.fetchall()
             return [(row[0], row[1]) for row in results]
