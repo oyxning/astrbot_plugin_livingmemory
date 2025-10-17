@@ -197,8 +197,10 @@
               )}" ${checked} />
             </td>
             <td class="mono">${escapeHTML(item.memory_id || item.doc_id || "-")}</td>
-            <td class="summary-cell" title="${escapeHTML(item.summary || "")}">
-              ${escapeHTML(item.summary || "（无摘要）")}
+            <td class="summary-cell" title="${escapeHTML(
+              item.full_content || item.summary || ""
+            )}">
+              ${escapeHTML(item.summary || "(empty)")}
             </td>
             <td>${escapeHTML(item.memory_type || "--")}</td>
             <td>${importance}</td>
@@ -395,9 +397,14 @@
   }
 
   function openDetailDrawer(item) {
-    dom.detail.memoryId.textContent = item.memory_id || item.doc_id || "--";
+    dom.detail.memoryId.textContent =
+      item.memory_id || item.doc_uuid || String(item.doc_id ?? "") || "--";
     dom.detail.source.textContent =
-      item.source === "storage" ? "自定义存储" : "向量存储";
+      item.source === "storage"
+        ? "自定义存储"
+        : item.source === "vector_store"
+        ? "向量存储"
+        : item.source || "--";
     dom.detail.status.textContent = item.status || "--";
     dom.detail.importance.textContent =
       item.importance !== undefined && item.importance !== null
