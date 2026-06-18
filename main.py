@@ -18,6 +18,7 @@ from .core.command_handler import CommandHandler
 from .core.event_handler import EventHandler
 from .core.plugin_initializer import PluginInitializer
 from .webui import WebUIServer
+from .external_api import ExternalAPIServer
 
 
 @register(
@@ -49,6 +50,9 @@ class LivingMemoryPlugin(Star):
 
         # WebUI 服务句柄
         self.webui_server: WebUIServer | None = None
+
+        # 外部 API 服务句柄
+        self.external_api_server: ExternalAPIServer | None = None
 
         # 后台任务跟踪集合
         self._background_tasks: set[asyncio.Task] = set()
@@ -121,6 +125,9 @@ class LivingMemoryPlugin(Star):
             if self.command_handler:
                 self.command_handler.webui_server = self.webui_server
 
+            # 启动外部 API（幂等）
+            await self._start_external_api()
+
         return True
 
     async def _ensure_plugin_ready(self) -> tuple[bool, str]:
@@ -178,6 +185,40 @@ class LivingMemoryPlugin(Star):
             self.webui_server = None
             if self.command_handler:
                 self.command_handler.webui_server = None
+
+    async def _start_external_api(self):
+        """根据配置启动外部 API 服务"""
+        external_api_config = self.config_manager.external_api
+        if not external_api_config.get("enabled"):
+            return
+        if self.external_api_server:
+            return
+
+        try:
+            self.external_api_server = ExternalAPIServer(
+                memory_engine=self.initializer.memory_engine,
+                config=external_api_config,
+            )
+
+            await self.external_api_server.start()
+
+            logger.info(
+                f"外部 API 已启动: http://{external_api_config.get('host', '127.0.0.1')}:{external_api_config.get('port', 8889)}"
+            )
+        except Exception as e:
+            logger.error(f"启动外部 API 失败: {e}", exc_info=True)
+            self.external_api_server = None
+
+    async def _stop_external_api(self):
+        """停止外部 API 服务"""
+        if not self.external_api_server:
+            return
+        try:
+            await self.external_api_server.stop()
+        except Exception as e:
+            logger.warning(f"停止外部 API 时出现异常: {e}", exc_info=True)
+        finally:
+            self.external_api_server = None
 
     def _get_initialization_status_message(self) -> str:
         """获取初始化状态的用户友好消息"""
@@ -490,6 +531,9 @@ class LivingMemoryPlugin(Star):
 
         # 停止 WebUI
         await self._stop_webui()
+
+        # 停止外部 API
+        await self._stop_external_api()
 
         # 停止衰减调度器
         await self.initializer.stop_scheduler()

@@ -166,6 +166,27 @@ class WebUISettings(BaseModel):
         return self
 
 
+class ExternalAPIConfig(BaseModel):
+    """外部 API 设置 — 供第三方平台（如写书平台）调用获取记忆内容"""
+
+    enabled: bool = Field(default=False, description="是否启用外部 API")
+    host: str = Field(default="127.0.0.1", description="外部 API 监听地址")
+    port: int = Field(default=8889, ge=1, le=65535, description="外部 API 监听端口")
+    api_key: str = Field(
+        default="",
+        description="API 密钥（外部调用方必须在请求头中携带此密钥）。留空时自动生成。",
+    )
+    max_batch_size: int = Field(
+        default=100, ge=1, le=1000, description="单次批量查询最大记忆条数"
+    )
+
+    @model_validator(mode="after")
+    def validate_api_key(self):
+        if self.enabled and not self.api_key:
+            logger.info("外部 API 未设置密钥，将在运行时自动生成随机密钥。")
+        return self
+
+
 class GraphMemoryConfig(BaseModel):
     """Graph-memory retrieval configuration."""
 
@@ -227,6 +248,9 @@ class LivingMemoryConfig(BaseModel):
     )
     importance_decay: ImportanceDecayConfig = Field(
         default_factory=ImportanceDecayConfig, description="重要性衰减配置"
+    )
+    external_api: ExternalAPIConfig = Field(
+        default_factory=ExternalAPIConfig, description="外部 API 配置"
     )
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容

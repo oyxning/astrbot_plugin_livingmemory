@@ -118,3 +118,8 @@ class ConfigManager:
     def graph_memory(self) -> dict[str, Any]:
         """Graph-memory settings."""
         return self.get_section("graph_memory")
+
+    @property
+    def external_api(self) -> dict[str, Any]:
+        """外部 API 配置"""
+        return self.get_section("external_api")

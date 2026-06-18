@@ -14,6 +14,7 @@
 - **自动遗忘**: 基于时间和重要性的智能清理机制
 - **数据安全**: 迁移前自动备份、索引重建带备份回滚、删除操作带事务保护
 - **WebUI 管理**: 可视化记忆管理界面
+- **外部 API**: 受 API Key 保护的 RESTful 接口，供第三方平台按 ID 获取记忆内容
 
 ---
 
@@ -39,6 +40,18 @@
     "host": "127.0.0.1",
     "port": 8080,
     "access_password": "your_password"
+  }
+}
+```
+
+**外部 API 配置**:
+```json
+{
+  "external_api": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8889,
+    "api_key": "your_secret_api_key"
   }
 }
 ```
@@ -78,6 +91,7 @@ astrbot_plugin_livingmemory/
 │   └── command_handler.py           # 命令处理器
 ├── storage/                         # 存储层（DBMigration、ConversationStore）
 ├── webui/                           # Web 管理界面
+├── external_api/                    # 外部 API 服务
 ├── tests/                           # 测试套件
 └── docs/                            # 文档
 ```
@@ -102,6 +116,87 @@ astrbot_plugin_livingmemory/
    - 集中配置加载
    - 配置验证
    - 嵌套键访问
+
+5. **ExternalAPIServer**: 外部 API 服务
+   - API Key 认证保护
+   - IP 级别频率限制（60s/30次）
+   - 按 ID 获取单条 / 批量获取 / 语义搜索
+
+---
+
+## 外部 API 参考
+
+启用 `external_api.enabled` 后，插件会在独立端口启动 RESTful API 服务，供第三方平台（如写书平台）调用获取记忆数据。所有数据接口均要求 API Key 认证。
+
+### 认证方式
+
+调用方必须在请求头中携带密钥（二选一）：
+
+```
+X-API-Key: <your_api_key>
+Authorization: Bearer <your_api_key>
+```
+
+未设置 `api_key` 时系统会自动生成 32 位随机密钥并输出到日志。
+
+### API 端点
+
+| 端点 | 方法 | 认证 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `/api/v1/health` | GET | 否 | 健康检查 |
+| `/api/v1/memories/{memory_id}` | GET | 是 | 按 ID 获取单条记忆 |
+| `/api/v1/memories/batch` | POST | 是 | 批量获取记忆 |
+| `/api/v1/memories/search` | POST | 是 | 语义搜索记忆 |
+
+### 调用示例
+
+**获取单条记忆：**
+```bash
+curl -H "X-API-Key: your_api_key" \
+  http://127.0.0.1:8889/api/v1/memories/42
+```
+
+**批量获取：**
+```bash
+curl -X POST \
+  -H "X-API-Key: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"memory_ids": [1, 2, 3, 42]}' \
+  http://127.0.0.1:8889/api/v1/memories/batch
+```
+
+返回示例：
+```json
+{
+  "success": true,
+  "data": {
+    "memories": {
+      "1": {"id": 1, "text": "用户偏好科幻小说...", "metadata": {...}},
+      "2": null
+    },
+    "requested_count": 2,
+    "found_count": 1
+  }
+}
+```
+
+**搜索记忆：**
+```bash
+curl -X POST \
+  -H "X-API-Key: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "角色设定", "k": 10}' \
+  http://127.0.0.1:8889/api/v1/memories/search
+```
+
+### 安全机制
+
+| 机制 | 说明 |
+| :--- | :--- |
+| API Key 认证 | 所有数据接口强制验证，密钥错误返回 403 |
+| 暴力破解防护 | 认证失败有 0.5s 延迟响应 |
+| IP 频率限制 | 每 IP 每 60 秒最多 30 次请求，超限返回 429 |
+| 批量查询上限 | 单次最多 100 条（可通过 `max_batch_size` 配置） |
 
 ---
 

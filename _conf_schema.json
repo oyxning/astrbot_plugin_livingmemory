@@ -366,5 +366,43 @@
         "default": true
       }
     }
+  },
+  "external_api": {
+    "description": "外部 API",
+    "hint": "供第三方平台（如写书平台）通过 API 获取指定记忆内容。需要 API Key 认证。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用外部 API",
+        "hint": "开启后将在独立端口启动外部 API 服务，供第三方平台调用。",
+        "type": "bool",
+        "default": false
+      },
+      "host": {
+        "description": "监听地址",
+        "hint": "127.0.0.1 仅本机访问；0.0.0.0 允许局域网/外部访问（需做好网络安全防护）。",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "description": "监听端口",
+        "hint": "外部 API 服务端口，确保不与 WebUI（默认8888）和 AstrBot 主端口冲突。",
+        "type": "int",
+        "default": 8889
+      },
+      "api_key": {
+        "description": "API 密钥",
+        "hint": "外部调用方须在请求头 X-API-Key 或 Authorization: Bearer 中携带此密钥。留空时系统自动生成随机密钥并在日志中提示。建议手动设置一个强随机字符串。",
+        "type": "string",
+        "obvious_hint": true,
+        "default": ""
+      },
+      "max_batch_size": {
+        "description": "单次批量查询上限",
+        "hint": "单次 POST /api/v1/memories/batch 最多返回的记忆条数。",
+        "type": "int",
+        "default": 100
+      }
+    }
   }
 }
