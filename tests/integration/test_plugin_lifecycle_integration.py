@@ -47,7 +47,7 @@ class _TestEvent:
 
 async def _build_plugin(monkeypatch, tmp_path, config: dict | None = None):
     monkeypatch.setattr(plugin_main, "PluginInitializer", _FakeInitializer)
-    monkeypatch.setattr(plugin_main.StarTools, "get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(plugin_main.StarTools, "get_data_dir", lambda plugin_name: tmp_path)
     plugin = plugin_main.LivingMemoryPlugin(context=Mock(), config=config or {})
     # Flush startup task callback queue to keep task set stable in assertions.
     await asyncio.sleep(0)
@@ -110,62 +110,11 @@ async def test_status_command_returns_not_ready_message_without_handler(
 
 
 @pytest.mark.asyncio
-async def test_webui_start_stop_updates_command_handler(monkeypatch, tmp_path):
-    class _FakeWebUIServer:
-        def __init__(
-            self,
-            memory_engine,
-            config,
-            conversation_manager=None,
-            index_validator=None,
-        ):
-            del memory_engine, config, conversation_manager, index_validator
-            self.started = False
-            self.stopped = False
-
-        async def start(self):
-            self.started = True
-
-        async def stop(self):
-            self.stopped = True
-
-    plugin = await _build_plugin(
-        monkeypatch,
-        tmp_path,
-        config={
-            "webui_settings": {
-                "enabled": True,
-                "host": "127.0.0.1",
-                "port": 6186,
-                "access_password": "test-password",
-            }
-        },
-    )
-    monkeypatch.setattr(plugin_main, "WebUIServer", _FakeWebUIServer)
-
-    plugin.initializer.memory_engine = SimpleNamespace(close=AsyncMock())
-    plugin.initializer.conversation_manager = SimpleNamespace(store=None)
-    plugin.initializer.index_validator = object()
-    plugin.command_handler = SimpleNamespace(webui_server=None)
-
-    await plugin._start_webui()
-    assert plugin.webui_server is not None
-    assert plugin.webui_server.started is True
-    assert plugin.command_handler.webui_server is plugin.webui_server
-
-    await plugin._stop_webui()
-    assert plugin.webui_server is None
-    assert plugin.command_handler.webui_server is None
-
-    await plugin.terminate()
-
-
-@pytest.mark.asyncio
 async def test_terminate_cleans_background_tasks_and_resources(monkeypatch, tmp_path):
     plugin = await _build_plugin(monkeypatch, tmp_path)
 
     plugin.event_handler = SimpleNamespace(shutdown=AsyncMock())
-    plugin.command_handler = SimpleNamespace(webui_server=None)
+    plugin.command_handler = SimpleNamespace()
     plugin.initializer.conversation_manager = SimpleNamespace(
         store=SimpleNamespace(close=AsyncMock())
     )

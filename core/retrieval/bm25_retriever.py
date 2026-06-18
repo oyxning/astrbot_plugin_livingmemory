@@ -4,10 +4,13 @@ BM25检索器 - 基于SQLite FTS5的稀疏检索
 """
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import aiosqlite
+
+from astrbot.api import logger
 
 from ..processors.text_processor import TextProcessor
 
@@ -24,7 +27,7 @@ class BM25Result:
 
 class BM25Retriever:
     """
-    BM25稀疏检索器
+    文档路 BM25 关键词检索器
 
     使用SQLite FTS5实现BM25算法的全文检索。
     主要特性:
@@ -50,17 +53,29 @@ class BM25Retriever:
         self.db_path = db_path
         self.text_processor = text_processor
         self.config = config or {}
-        self.fts_table = "memories_fts"
+        self.fts_table = "livingmemory_memories_fts"
         self.doc_table = "documents"
+
+    @asynccontextmanager
+    async def _connect(self):
+        """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
+        db = await aiosqlite.connect(self.db_path)
+        try:
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.execute("PRAGMA busy_timeout = 10000")
+            yield db
+        finally:
+            await db.close()
 
     async def initialize(self):
         """
         初始化FTS5索引
 
-        创建memories_fts虚拟表用于全文检索。
+        创建 livingmemory_memories_fts 虚拟表用于全文检索。
         使用unicode61分词器处理已预处理的文本。
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            await self._warn_if_legacy_documents_fts_exists(db)
             # 创建FTS5虚拟表
             await db.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS {self.fts_table}
@@ -71,6 +86,36 @@ class BM25Retriever:
                 )
             """)
             await db.commit()
+
+    async def _warn_if_legacy_documents_fts_exists(self, db: aiosqlite.Connection):
+        cursor = await db.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='documents_fts'
+        """)
+        row = await cursor.fetchone()
+        if not row:
+            return
+
+        if await self._is_legacy_livingmemory_documents_fts(db, row[0] or ""):
+            logger.warning(
+                "检测到插件废弃 documents_fts 表；当前版本改用 livingmemory_memories_fts，"
+                "请确认数据库迁移已执行到 v6"
+            )
+
+    async def _is_legacy_livingmemory_documents_fts(
+        self,
+        db: aiosqlite.Connection,
+        create_sql: str,
+    ) -> bool:
+        normalized_sql = " ".join(create_sql.lower().replace("\n", " ").split())
+        expected_sql = "create virtual table documents_fts using fts5(content, doc_id, tokenize='unicode61')"
+        if normalized_sql != expected_sql:
+            return False
+
+        cursor = await db.execute("PRAGMA table_xinfo(documents_fts)")
+        rows = await cursor.fetchall()
+        visible_columns = [row[1] for row in rows if int(row[6]) == 0]
+        return visible_columns == ["content", "doc_id"]
 
     async def add_document(
         self, doc_id: int, content: str, metadata: dict[str, Any] | None = None
@@ -83,11 +128,13 @@ class BM25Retriever:
             content: 文档内容(原始文本)
             metadata: 文档元数据(可选,用于过滤但不索引)
         """
-        # 使用TextProcessor预处理文本
-        tokens = self.text_processor.tokenize(content, remove_stopwords=True)
+        # 使用TextProcessor预处理文本（异步卸载 jieba 分词到线程池）
+        tokens = await self.text_processor.tokenize_async(
+            content, remove_stopwords=True
+        )
         processed_content = " ".join(tokens)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # 插入到FTS表
             await db.execute(
                 f"INSERT INTO {self.fts_table}(doc_id, content) VALUES (?, ?)",
@@ -117,8 +164,8 @@ class BM25Retriever:
         if not query or not query.strip():
             return []
 
-        # 预处理查询
-        tokens = self.text_processor.tokenize(query, remove_stopwords=True)
+        # 预处理查询（异步卸载 jieba 分词到线程池）
+        tokens = await self.text_processor.tokenize_async(query, remove_stopwords=True)
         if not tokens:
             return []
 
@@ -138,7 +185,7 @@ class BM25Retriever:
         has_filters = session_id is not None or persona_id is not None
         fetch_limit = limit * 10 if has_filters else limit * 2
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # 执行FTS5 BM25搜索
             # 注意: SQLite FTS5 bm25() 分数越小越相关（常见为负数）
             cursor = await db.execute(
@@ -239,7 +286,7 @@ class BM25Retriever:
         from astrbot.api import logger
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 await db.execute(
                     f"DELETE FROM {self.fts_table} WHERE doc_id = ?", (doc_id,)
                 )
@@ -267,11 +314,13 @@ class BM25Retriever:
         from astrbot.api import logger
 
         try:
-            # 重新处理内容
-            tokens = self.text_processor.tokenize(content, remove_stopwords=True)
+            # 重新处理内容（异步卸载 jieba 分词到线程池）
+            tokens = await self.text_processor.tokenize_async(
+                content, remove_stopwords=True
+            )
             processed_content = " ".join(tokens)
 
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 # 先删除旧索引
                 await db.execute(
                     f"DELETE FROM {self.fts_table} WHERE doc_id = ?", (doc_id,)

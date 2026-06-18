@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from ..models.memory_atom import compute_decay_score
+from ..utils.number_utils import clamp_float, safe_float
 from .graph_keyword_retriever import GraphKeywordRetriever
 from .graph_vector_retriever import GraphVectorRetriever
 from .rrf_fusion import BM25Result, RRFFusion, VectorResult
@@ -108,24 +110,37 @@ class GraphRetriever:
             if not isinstance(metadata, dict):
                 metadata = {}
 
-            importance = max(0.0, min(1.0, float(metadata.get("importance", 0.5))))
-            create_time = float(metadata.get("create_time") or current_time)
-            last_access_time = float(metadata.get("last_access_time") or 0.0)
+            importance = clamp_float(metadata.get("importance"), default=0.5)
+            create_time = safe_float(metadata.get("create_time"), current_time)
+            last_access_time = safe_float(metadata.get("last_access_time"), 0.0)
             reference_time = max(create_time, last_access_time)
             days_old = max(0.0, (current_time - reference_time) / 86400)
             recency_weight = math.exp(-self.decay_rate * days_old)
-            graph_confidence = max(
-                0.0,
-                min(1.0, float(metadata.get("graph_confidence", 0.7))),
+            graph_confidence = clamp_float(
+                metadata.get("graph_confidence"), default=0.7
             )
             rrf_normalized = item.rrf_score / max_rrf
+
+            # Temporal decay: use atom-level TTL when available
+            atom_ttl = safe_float(metadata.get("ttl_days"), 0.0)
+            temporal_factor = 1.0
+            decay_type = str(metadata.get("decay_type", ""))
+            if atom_ttl > 0:
+                days_since_access = max(
+                    0.0, (current_time - last_access_time) / 86400.0
+                )
+                temporal_factor = compute_decay_score(
+                    decay_type,
+                    atom_ttl,
+                    days_since_access,
+                )
 
             final_score = (
                 self.score_alpha * rrf_normalized
                 + self.score_beta * importance
                 + self.score_gamma * recency_weight
                 + self.score_delta * graph_confidence
-            )
+            ) * temporal_factor
 
             results.append(
                 GraphResult(
@@ -141,6 +156,7 @@ class GraphRetriever:
                         "graph_importance": round(importance, 4),
                         "graph_recency_weight": round(recency_weight, 4),
                         "graph_confidence": round(graph_confidence, 4),
+                        "graph_temporal_factor": round(temporal_factor, 4),
                         "graph_final_score": round(final_score, 4),
                     },
                 )

@@ -62,7 +62,6 @@ async def test_process_conversation_success():
     content, metadata, importance = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -80,7 +79,6 @@ async def test_process_conversation_handles_non_json_response_with_fallback():
     content, metadata, importance = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -136,7 +134,6 @@ async def test_dual_channel_summary_stores_canonical_and_persona():
     content, metadata, importance = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -172,7 +169,6 @@ async def test_canonical_summary_includes_key_facts():
     content, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -198,7 +194,6 @@ async def test_summary_quality_normal_for_valid_response():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -222,7 +217,6 @@ async def test_summary_quality_low_for_empty_summary():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -246,7 +240,6 @@ async def test_summary_quality_low_for_missing_key_facts():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -270,7 +263,6 @@ async def test_summary_quality_low_for_generic_terms():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -280,35 +272,102 @@ async def test_summary_quality_low_for_generic_terms():
 def test_validate_summary_quality_directly():
     """直接测试 _validate_summary_quality 的各种边界情况。"""
     from unittest.mock import MagicMock
+
     processor = MemoryProcessor(llm_provider=MagicMock(), context=None)
 
     # 正常情况
-    assert processor._validate_summary_quality({
-        "summary": "用户明确表示喜欢吃寿司",
-        "key_facts": ["用户喜欢寿司"],
-        "importance": 0.7,
-    }) == "normal"
+    assert (
+        processor._validate_summary_quality(
+            {
+                "summary": "用户明确表示喜欢吃寿司",
+                "key_facts": ["用户喜欢寿司"],
+                "importance": 0.7,
+            }
+        )
+        == "normal"
+    )
 
     # summary 过短
-    assert processor._validate_summary_quality({
-        "summary": "短",
-        "key_facts": ["fact"],
-        "importance": 0.5,
-    }) == "low"
+    assert (
+        processor._validate_summary_quality(
+            {
+                "summary": "短",
+                "key_facts": ["fact"],
+                "importance": 0.5,
+            }
+        )
+        == "low"
+    )
 
     # importance 超出范围
-    assert processor._validate_summary_quality({
-        "summary": "用户明确表示喜欢吃寿司",
-        "key_facts": ["用户喜欢寿司"],
-        "importance": 1.5,
-    }) == "low"
+    assert (
+        processor._validate_summary_quality(
+            {
+                "summary": "用户明确表示喜欢吃寿司",
+                "key_facts": ["用户喜欢寿司"],
+                "importance": 1.5,
+            }
+        )
+        == "low"
+    )
 
     # 泛化词检测
-    assert processor._validate_summary_quality({
-        "summary": "有人提到了一些事情",
-        "key_facts": ["有人说话"],
-        "importance": 0.5,
-    }) == "low"
+    assert (
+        processor._validate_summary_quality(
+            {
+                "summary": "有人提到了一些事情",
+                "key_facts": ["有人说话"],
+                "importance": 0.5,
+            }
+        )
+        == "low"
+    )
+
+
+def test_build_memory_from_structured_data_uses_standard_storage_format():
+    processor = MemoryProcessor(llm_provider=Mock(), context=None)
+
+    content, metadata, importance = processor.build_memory_from_structured_data(
+        {
+            "summary": "用户希望主动记忆工具复用自动总结格式",
+            "topics": ["LivingMemory", "主动记忆"],
+            "key_facts": ["主动记忆应复用 MemoryProcessor 格式化流程"],
+            "sentiment": "neutral",
+            "importance": 0.8,
+        },
+        is_group_chat=False,
+        fallback_excerpt="fallback",
+    )
+
+    assert content == metadata["canonical_summary"]
+    assert metadata["persona_summary"] == "用户希望主动记忆工具复用自动总结格式"
+    assert metadata["topics"] == ["LivingMemory", "主动记忆"]
+    assert metadata["key_facts"] == ["主动记忆应复用 MemoryProcessor 格式化流程"]
+    assert metadata["sentiment"] == "neutral"
+    assert metadata["interaction_type"] == "private_chat"
+    assert metadata["summary_schema_version"] == "v2"
+    assert metadata["summary_quality"] == "normal"
+    assert importance == 0.8
+
+
+def test_build_memory_from_structured_data_flags_low_quality_for_out_of_range_importance():
+    """与自动总结路径一致：原始 importance 越界时应判为 low quality。"""
+    processor = MemoryProcessor(llm_provider=Mock(), context=None)
+
+    _, metadata, importance = processor.build_memory_from_structured_data(
+        {
+            "summary": "用户希望主动记忆工具复用自动总结格式",
+            "topics": ["测试"],
+            "key_facts": ["importance 越界"],
+            "sentiment": "neutral",
+            "importance": 1.5,
+        },
+        is_group_chat=False,
+        fallback_excerpt="fallback",
+    )
+
+    assert metadata["summary_quality"] == "low"
+    assert importance == 1.0
 
 
 # ── 群聊路径测试 ──────────────────────────────────────────────────────────────
@@ -371,7 +430,6 @@ async def test_process_group_chat_sets_interaction_type():
     content, metadata, importance = await processor.process_conversation(
         messages=_make_group_messages(),
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
@@ -397,7 +455,6 @@ async def test_process_group_chat_extracts_participants():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_group_messages(),
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
@@ -425,7 +482,6 @@ async def test_process_group_chat_dual_channel_summary():
     content, metadata, _ = await processor.process_conversation(
         messages=_make_group_messages(),
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
@@ -455,7 +511,6 @@ async def test_process_group_chat_missing_participants_uses_default():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_group_messages(),
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
@@ -481,7 +536,6 @@ async def test_process_private_chat_no_participants_field():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_messages(),
         is_group_chat=False,
-        save_original=False,
         persona_id=None,
     )
 
@@ -499,7 +553,8 @@ async def test_process_group_chat_long_content():
                 id=i + 1,
                 session_id="aiocqhttp:GroupMessage:99999",
                 role="user",
-                content=f"成员{i % 5} 说：这是第 {i+1} 条消息，内容比较详细，包含了很多信息。" * 3,
+                content=f"成员{i % 5} 说：这是第 {i + 1} 条消息，内容比较详细，包含了很多信息。"
+                * 3,
                 sender_id=str(10000 + i % 5),
                 sender_name=f"成员{i % 5}",
                 group_id="99999",
@@ -523,7 +578,6 @@ async def test_process_group_chat_long_content():
     content, metadata, importance = await processor.process_conversation(
         messages=long_messages,
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
@@ -551,8 +605,54 @@ async def test_process_group_chat_quality_low_for_generic_terms():
     _, metadata, _ = await processor.process_conversation(
         messages=_make_group_messages(),
         is_group_chat=True,
-        save_original=False,
         persona_id=None,
     )
 
     assert metadata.get("summary_quality") == "low"
+
+
+def test_format_conversation_sanitizes_multimodal_private_message():
+    processor = MemoryProcessor(llm_provider=None, context=None)
+    message = Message(
+        id=1,
+        session_id="s1",
+        role="user",
+        content=[
+            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+            {"type": "text", "text": "这张图里有会议安排"},
+        ],
+        sender_id="u1",
+        sender_name="张三",
+        group_id=None,
+        platform="test",
+        metadata={},
+    )
+
+    formatted = processor._format_conversation([message])
+
+    assert "这张图里有会议安排" in formatted
+    assert "image_url" not in formatted
+    assert "example.test" not in formatted
+
+
+def test_format_conversation_uses_placeholder_for_image_only_group_message():
+    processor = MemoryProcessor(llm_provider=None, context=None)
+    message = Message(
+        id=1,
+        session_id="g1",
+        role="user",
+        content=[
+            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+        ],
+        sender_id="u1",
+        sender_name="张三",
+        group_id="group1",
+        platform="test",
+        metadata={},
+    )
+
+    formatted = processor._format_conversation([message])
+
+    assert "张三" in formatted
+    assert "[图片消息]" in formatted
+    assert "image_url" not in formatted

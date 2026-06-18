@@ -5,12 +5,14 @@
 
 import asyncio
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.star import Context
-from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 from astrbot.core.provider.provider import EmbeddingProvider, Provider
 
 from ..storage.conversation_store import ConversationStore
@@ -22,6 +24,8 @@ from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
 from .schedulers.decay_scheduler import DecayScheduler
 from .validators.index_validator import IndexValidator
+
+FaissVecDB: Any = None
 
 
 class PluginInitializer:
@@ -43,8 +47,8 @@ class PluginInitializer:
         # 组件实例
         self.embedding_provider: EmbeddingProvider | None = None
         self.llm_provider: Provider | None = None
-        self.db: FaissVecDB | None = None
-        self.graph_db: FaissVecDB | None = None
+        self.db: Any | None = None
+        self.graph_db: Any | None = None
         self.memory_engine: MemoryEngine | None = None
         self.memory_processor: MemoryProcessor | None = None
         self.db_migration: DBMigration | None = None
@@ -217,7 +221,7 @@ class PluginInitializer:
         # 初始化 Embedding Provider
         emb_id = self.config_manager.get("provider_settings.embedding_provider_id")
         if emb_id:
-            provider = self.context.get_provider_by_id(emb_id)
+            provider = self._get_provider_by_id(emb_id, silent=silent)
             if provider and isinstance(provider, EmbeddingProvider):
                 self.embedding_provider = provider
                 if not silent:
@@ -245,7 +249,7 @@ class PluginInitializer:
         self.llm_provider = None
         llm_id = self.config_manager.get("provider_settings.llm_provider_id")
         if llm_id:
-            provider = self.context.get_provider_by_id(llm_id)
+            provider = self._get_provider_by_id(llm_id, silent=silent)
             if provider and isinstance(provider, Provider):
                 self.llm_provider = provider
                 if not silent:
@@ -257,6 +261,9 @@ class PluginInitializer:
 
         if not self.llm_provider:
             try:
+                if silent and not self.context.get_all_providers():
+                    self.llm_provider = None
+                    return
                 default_provider = self.context.get_using_provider()
                 if default_provider and not isinstance(default_provider, Provider):
                     if not silent:
@@ -273,6 +280,63 @@ class PluginInitializer:
                     logger.debug(f"获取默认 LLM Provider 失败: {e}")
                 self.llm_provider = None
 
+    def _get_provider_by_id(self, provider_id: str, *, silent: bool):
+        """静默检查阶段绕过会打印 warning 的 AstrBot 查询接口。"""
+        if not provider_id:
+            return None
+        if not silent:
+            return self.context.get_provider_by_id(provider_id)
+        provider_manager = getattr(self.context, "provider_manager", None)
+        inst_map = getattr(provider_manager, "inst_map", None)
+        if isinstance(inst_map, dict):
+            return inst_map.get(provider_id)
+        return None
+
+    def _check_faiss_runtime(self) -> None:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "import faiss"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise InitializationError(
+                "FAISS 运行时检查失败，无法安全初始化向量数据库。"
+                "请确认 faiss-cpu 已正确安装，或改用兼容当前 CPU 的 FAISS 包。"
+            ) from exc
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            if result.returncode < 0:
+                details = f"进程被信号 {-result.returncode} 终止。{details}".strip()
+            raise InitializationError(
+                "FAISS 初始化失败，当前 CPU 或运行环境可能不兼容 faiss-cpu。"
+                "无 AVX2 的 CPU 上可能触发 Illegal instruction；"
+                "请使用支持 AVX2 的 CPU、安装兼容版本 FAISS，或更换运行环境。"
+                f"{' 原始错误: ' + details if details else ''}"
+            )
+
+    def _load_faiss_vec_db_class(self):
+        global FaissVecDB
+        if FaissVecDB is not None:
+            return FaissVecDB
+
+        self._check_faiss_runtime()
+        try:
+            from astrbot.core.db.vec_db.faiss_impl.vec_db import (
+                FaissVecDB as LoadedFaissVecDB,
+            )
+        except (ImportError, ModuleNotFoundError, SystemError, OSError) as exc:
+            raise InitializationError(
+                "FAISS 初始化失败，无法加载 AstrBot FaissVecDB。"
+                "请检查 faiss-cpu 安装状态和 CPU 指令集兼容性。"
+            ) from exc
+
+        FaissVecDB = LoadedFaissVecDB
+        return LoadedFaissVecDB
+
     async def _complete_initialization(self):
         """完成完整的初始化流程"""
         if self._initialization_complete:
@@ -287,28 +351,34 @@ class PluginInitializer:
             index_path = data_dir_path / "livingmemory.index"
             graph_doc_path = data_dir_path / "livingmemory_graph_documents.db"
             graph_index_path = data_dir_path / "livingmemory_graph.index"
+            graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
 
             if not self.embedding_provider:
                 raise ProviderNotReadyError("Embedding Provider 未初始化")
             if not self.llm_provider or not isinstance(self.llm_provider, Provider):
                 raise ProviderNotReadyError("LLM Provider 未初始化或类型不正确")
 
+            faiss_vec_db_cls = self._load_faiss_vec_db_class()
+
             # 检查索引文件维度与当前 embedding provider 维度是否一致
             await self._check_and_fix_dimension_mismatch(str(index_path))
-            await self._check_and_fix_dimension_mismatch(str(graph_index_path))
+            if graph_memory_enabled:
+                await self._check_and_fix_dimension_mismatch(str(graph_index_path))
 
-            self.db = FaissVecDB(
+            self.db = faiss_vec_db_cls(
                 str(db_path),
                 str(index_path),
                 self.embedding_provider,
             )
             await self.db.initialize()
-            self.graph_db = FaissVecDB(
-                str(graph_doc_path),
-                str(graph_index_path),
-                self.embedding_provider,
-            )
-            await self.graph_db.initialize()
+            self.graph_db = None
+            if graph_memory_enabled:
+                self.graph_db = faiss_vec_db_cls(
+                    str(graph_doc_path),
+                    str(graph_index_path),
+                    self.embedding_provider,
+                )
+                await self.graph_db.initialize()
             logger.info(f"数据库已初始化。数据目录: {self.data_dir}")
 
             # 初始化数据库迁移管理器
@@ -327,8 +397,26 @@ class PluginInitializer:
                 "decay_rate": self.config_manager.get(
                     "importance_decay.decay_rate", 0.01
                 ),
+                "access_decay_window_days": self.config_manager.get(
+                    "importance_decay.access_decay_window_days", 30.0
+                ),
+                "access_decay_max_count": self.config_manager.get(
+                    "importance_decay.access_decay_max_count", 10
+                ),
+                "access_count_decay_multiplier": self.config_manager.get(
+                    "importance_decay.access_count_decay_multiplier", 0.5
+                ),
                 "importance_weight": self.config_manager.get(
                     "recall_engine.importance_weight", 1.0
+                ),
+                "search_cache_enabled": self.config_manager.get(
+                    "recall_engine.search_cache_enabled", True
+                ),
+                "search_cache_ttl_seconds": self.config_manager.get(
+                    "recall_engine.search_cache_ttl_seconds", 45.0
+                ),
+                "search_cache_max_size": self.config_manager.get(
+                    "recall_engine.search_cache_max_size", 256
                 ),
                 "fallback_enabled": self.config_manager.get(
                     "recall_engine.fallback_to_vector", True
@@ -343,9 +431,7 @@ class PluginInitializer:
                     "forgetting_agent.auto_cleanup_enabled", True
                 ),
                 "stopwords_path": str(stopwords_dir),
-                "graph_memory_enabled": self.config_manager.get(
-                    "graph_memory.enabled", True
-                ),
+                "graph_memory_enabled": graph_memory_enabled,
                 "document_route_weight": self.config_manager.get(
                     "graph_memory.document_route_weight", 0.65
                 ),
@@ -358,6 +444,15 @@ class PluginInitializer:
                 "graph_expansion_limit": self.config_manager.get(
                     "graph_memory.expansion_limit", 24
                 ),
+                "graph_expansion_hops": self.config_manager.get(
+                    "graph_memory.expansion_hops", 1
+                ),
+                "graph_second_hop_weight": self.config_manager.get(
+                    "graph_memory.second_hop_weight", 0.4
+                ),
+                "dynamic_route_weighting": self.config_manager.get(
+                    "graph_memory.dynamic_route_weighting", True
+                ),
                 "graph_max_topics": self.config_manager.get(
                     "graph_memory.max_topics_per_memory", 6
                 ),
@@ -366,6 +461,42 @@ class PluginInitializer:
                 ),
                 "graph_max_facts": self.config_manager.get(
                     "graph_memory.max_facts_per_memory", 8
+                ),
+                "atom_enabled": self.config_manager.get(
+                    "graph_memory.atom_enabled", True
+                ),
+                "atom_maintenance_interval_hours": self.config_manager.get(
+                    "graph_memory.atom_maintenance_interval_hours", 24.0
+                ),
+                "atom_forget_delay_days": self.config_manager.get(
+                    "graph_memory.atom_forget_delay_days", 7.0
+                ),
+                "atom_purge_delay_days": self.config_manager.get(
+                    "graph_memory.atom_purge_delay_days", 30.0
+                ),
+                "index_rebuild_batch_size": self.config_manager.get(
+                    "index_rebuild_settings.batch_size", 50
+                ),
+                "index_rebuild_embedding_batch_size": self.config_manager.get(
+                    "index_rebuild_settings.embedding_batch_size", 8
+                ),
+                "index_rebuild_tasks_limit": self.config_manager.get(
+                    "index_rebuild_settings.tasks_limit", 1
+                ),
+                "index_rebuild_max_retries": self.config_manager.get(
+                    "index_rebuild_settings.max_retries", 5
+                ),
+                "index_rebuild_retry_base_delay": self.config_manager.get(
+                    "index_rebuild_settings.retry_base_delay", 30.0
+                ),
+                "index_rebuild_batch_delay": self.config_manager.get(
+                    "index_rebuild_settings.batch_delay", 5.0
+                ),
+                "index_rebuild_request_delay": self.config_manager.get(
+                    "index_rebuild_settings.request_delay", 5.0
+                ),
+                "index_rebuild_max_failure_ratio": self.config_manager.get(
+                    "index_rebuild_settings.max_failure_ratio", 0.02
                 ),
             }
 
@@ -397,9 +528,18 @@ class PluginInitializer:
             await self._repair_message_counts(conversation_store)
 
             # 初始化 MemoryProcessor
-            if not self.llm_provider or not isinstance(self.llm_provider, Provider):
-                raise ProviderNotReadyError("LLM Provider 未初始化或类型不正确")
-            self.memory_processor = MemoryProcessor(self.llm_provider, self.context)
+            # 注意：MemoryProcessor 不直接持有 llm_provider 实例引用，
+            # 而是在每次调用时通过 AstrBot 上下文动态解析 Provider，
+            # 以避免 AstrBot 重新创建 Provider 后旧实例的 httpx client 被关闭
+            # 导致的 "Cannot send a request, as the client has been closed" 错误。
+            llm_id = self.config_manager.get("provider_settings.llm_provider_id")
+            self.memory_processor = MemoryProcessor(
+                self.context,
+                llm_provider=llm_id if llm_id else None,
+                config={
+                    "atom_enabled": memory_engine_config["atom_enabled"],
+                },
+            )
             logger.info("MemoryProcessor 已初始化")
 
             # 初始化索引验证器并自动重建索引
@@ -468,9 +608,7 @@ class PluginInitializer:
                 if backup_path:
                     logger.info(f"数据库备份已创建: {backup_path}")
 
-            result = await self.db_migration.migrate(
-                sparse_retriever=None, progress_callback=None
-            )
+            result = await self.db_migration.migrate(progress_callback=None)
 
             if result.get("success"):
                 logger.info(f"数据库迁移结果: {result.get('message')}")
@@ -601,7 +739,13 @@ class PluginInitializer:
             return
 
         try:
-            import faiss
+            try:
+                import faiss
+            except (ImportError, ModuleNotFoundError, SystemError, OSError) as exc:
+                raise InitializationError(
+                    "FAISS 初始化失败，无法读取索引文件。"
+                    "请检查 faiss-cpu 安装状态和 CPU 指令集兼容性。"
+                ) from exc
 
             old_index = faiss.read_index(index_path)
             old_dim = old_index.d
@@ -621,8 +765,22 @@ class PluginInitializer:
                 logger.info(f"已删除不兼容的旧索引文件: {index_path}")
                 logger.info("注意: 向量检索功能将暂时不可用，直到重新导入记忆数据。")
 
+        except InitializationError:
+            raise
         except Exception as e:
-            logger.error(f"检查索引维度时出错: {e}", exc_info=True)
+            quarantine_path = f"{index_path}.corrupt_{int(time.time())}"
+            try:
+                os.replace(index_path, quarantine_path)
+                logger.error(
+                    f"FAISS 索引文件不可读，已隔离坏文件: {quarantine_path}。"
+                    "系统将创建空索引，并在初始化后尝试分批重建。",
+                    exc_info=True,
+                )
+            except Exception:
+                logger.error(
+                    f"检查索引维度时出错，且隔离坏索引失败: {e}",
+                    exc_info=True,
+                )
 
     async def stop_scheduler(self) -> None:
         """停止衰减调度器"""

@@ -12,6 +12,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ..utils.number_utils import clamp_float, safe_float
 from .bm25_retriever import BM25Retriever
 from .rrf_fusion import BM25Result, FusedResult, RRFFusion, VectorResult
 from .vector_retriever import VectorRetriever
@@ -83,6 +84,18 @@ class HybridRetriever:
         # MMR 多样性参数
         self.mmr_lambda = self.config.get("mmr_lambda", 0.7)  # 相关性 vs 多样性权衡
 
+    async def _search_route(
+        self, route_name: str, search_coro
+    ) -> tuple[list, Exception | None]:
+        """Run one retrieval route and convert ordinary failures into route errors."""
+        try:
+            return await search_coro, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"{route_name}检索异常: {e}", exc_info=True)
+            return [], e
+
     async def add_memory(
         self, content: str, metadata: dict[str, Any] | None = None
     ) -> int:
@@ -143,96 +156,48 @@ class HybridRetriever:
             return []
 
         # 1. 并行执行两路检索
-        bm25_results = None
-        vector_results = None
-        bm25_error = None
-        vector_error = None
-
-        try:
-            # 使用asyncio.gather并行执行
-            results = await asyncio.gather(
+        (
+            (bm25_results, bm25_error),
+            (vector_results, vector_error),
+        ) = await asyncio.gather(
+            self._search_route(
+                "BM25",
                 self.bm25_retriever.search(query, k, session_id, persona_id),
+            ),
+            self._search_route(
+                "向量",
                 self.vector_retriever.search(query, k, session_id, persona_id),
-                return_exceptions=True,
-            )
-
-            # 检查结果
-            if isinstance(results[0], Exception):
-                bm25_error = results[0]
-                logger.error(f"BM25检索异常: {bm25_error}")
-            else:
-                bm25_results = results[0]
-
-            if isinstance(results[1], Exception):
-                vector_error = results[1]
-                logger.error(f"向量检索异常: {vector_error}")
-            else:
-                vector_results = results[1]
-
-        except Exception as e:
-            # 如果整体失败,尝试单独执行
-            if self.fallback_enabled:
-                try:
-                    bm25_results = await self.bm25_retriever.search(
-                        query, k, session_id, persona_id
-                    )
-                except Exception as be:
-                    bm25_error = be
-                    logger.warning(f"BM25检索失败: {bm25_error}")
-
-                try:
-                    vector_results = await self.vector_retriever.search(
-                        query, k, session_id, persona_id
-                    )
-                except Exception as ve:
-                    vector_error = ve
-                    logger.warning(f"向量检索失败: {vector_error}")
-
-            else:
-                raise e
+            ),
+        )
 
         # 2. 处理退化情况
-        if not bm25_results and not vector_results:
-            # 两路都失败
+        if bm25_error and vector_error:
             return []
 
-        if not bm25_results and self.fallback_enabled and vector_results:
-            # 只有向量结果,使用向量退化
-            if not isinstance(vector_results, BaseException):
+        if bm25_error:
+            if self.fallback_enabled and vector_results:
                 return self._fallback_vector_only(vector_results, k)
             return []
 
-        if not vector_results and self.fallback_enabled and bm25_results:
-            # 只有BM25结果,使用BM25退化
-            if not isinstance(bm25_results, BaseException):
+        if vector_error:
+            if self.fallback_enabled and bm25_results:
                 return self._fallback_bm25_only(bm25_results, k)
             return []
 
         # 3. RRF融合
-        # 确保结果不是异常
-        valid_bm25 = (
-            bm25_results if not isinstance(bm25_results, BaseException) else None
-        )
-        valid_vector = (
-            vector_results if not isinstance(vector_results, BaseException) else None
-        )
-
-        if valid_bm25 is None or valid_vector is None:
-            return []
-
         # 转换结果类型以匹配RRF融合器期望的类型
         rrf_bm25_results = [
             BM25Result(
                 doc_id=r.doc_id, score=r.score, content=r.content, metadata=r.metadata
             )
-            for r in valid_bm25
+            for r in bm25_results
         ]
 
         rrf_vector_results = [
             VectorResult(
                 doc_id=r.doc_id, score=r.score, content=r.content, metadata=r.metadata
             )
-            for r in valid_vector
+            for r in vector_results
         ]
 
         fused_results = self.rrf_fusion.fuse(
@@ -242,13 +207,17 @@ class HybridRetriever:
         if not fused_results:
             return []
 
-        # 4. 应用加权
+        # 4. 应用加权（通过线程池卸载 CPU 密集型 json.loads + 循环）
         current_time = time.time()
-        weighted_results = self._apply_weighting(fused_results, current_time)
+        weighted_results = await asyncio.to_thread(
+            self._apply_weighting, fused_results, current_time
+        )
 
-        # 5. MMR 去重：在保证相关性的同时提升结果多样性
+        # 5. MMR 去重（通过线程池卸载 O(k*n) Jaccard 集合运算）
         if len(weighted_results) > 1:
-            weighted_results = self._apply_mmr(weighted_results, k)
+            weighted_results = await asyncio.to_thread(
+                self._apply_mmr, weighted_results, k
+            )
 
         return weighted_results
 
@@ -306,12 +275,12 @@ class HybridRetriever:
                 metadata = {}
 
             # 获取重要性(默认0.5)，限制在 [0, 1]
-            importance = max(0.0, min(1.0, metadata.get("importance", 0.5)))
+            importance = clamp_float(metadata.get("importance"), default=0.5)
 
             # 时间衰减：取 create_time 与 last_access_time 的较大值
             # 高频访问的记忆衰减更慢，符合"记忆强化"认知规律
-            create_time = metadata.get("create_time", current_time)
-            last_access_time = metadata.get("last_access_time", 0)
+            create_time = safe_float(metadata.get("create_time"), current_time)
+            last_access_time = safe_float(metadata.get("last_access_time"), 0.0)
             reference_time = max(create_time, last_access_time)
             days_old = max(0.0, (current_time - reference_time) / 86400)
             recency_weight = math.exp(-self.decay_rate * days_old)
@@ -491,15 +460,13 @@ class HybridRetriever:
         Returns:
             bool: 是否成功删除
         """
-        import aiosqlite
-
         backup_content: str | None = None
         backup_metadata: dict[str, Any] = {}
 
         try:
             # Backup the original document so BM25 can be restored on failure.
             try:
-                async with aiosqlite.connect(self.bm25_retriever.db_path) as db:
+                async with self.bm25_retriever._connect() as db:
                     cursor = await db.execute(
                         "SELECT text, metadata FROM documents WHERE id = ?", (doc_id,)
                     )
@@ -549,7 +516,7 @@ class HybridRetriever:
 
             # 最后删除documents表记录
             try:
-                async with aiosqlite.connect(self.bm25_retriever.db_path) as db:
+                async with self.bm25_retriever._connect() as db:
                     await db.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
                     await db.commit()
                 logger.debug(f"[删除] documents表已删除 (doc_id={doc_id})")

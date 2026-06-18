@@ -11,10 +11,8 @@ import time
 
 import aiosqlite
 import pytest
-
-from astrbot_plugin_livingmemory.storage.db_migration import DBMigration
 from astrbot_plugin_livingmemory.core.utils import format_memories_for_injection
-
+from astrbot_plugin_livingmemory.storage.db_migration import DBMigration
 
 # ---------------------------------------------------------------------------
 # 真实记忆内容样本（私聊 / 群聊，长文本）
@@ -102,6 +100,7 @@ GROUP_METADATA_V2 = {
 # 辅助函数
 # ---------------------------------------------------------------------------
 
+
 async def _create_legacy_db(db_path: str, rows: list[dict]) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
@@ -121,7 +120,9 @@ async def _create_legacy_db(db_path: str, rows: list[dict]) -> None:
 
 async def _get_all_metadata(db_path: str) -> list[dict]:
     async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute("SELECT id, text, metadata FROM documents ORDER BY id")
+        cursor = await db.execute(
+            "SELECT id, text, metadata FROM documents ORDER BY id"
+        )
         rows = await cursor.fetchall()
     result = []
     for row in rows:
@@ -141,17 +142,21 @@ async def _get_all_metadata(db_path: str) -> list[dict]:
 # 一、迁移正确性测试
 # ===========================================================================
 
+
 @pytest.mark.asyncio
 async def test_migrate_private_chat_legacy_record(tmp_path):
     """私聊旧记录迁移后应补充 summary_schema_version=v1，原有字段不丢失。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -168,13 +173,16 @@ async def test_migrate_private_chat_legacy_record(tmp_path):
 async def test_migrate_group_chat_legacy_record(tmp_path):
     """群聊旧记录迁移后应补充 summary_schema_version=v1，participants 字段保留。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": GROUP_MEMORY_LONG, "metadata": json.dumps(GROUP_METADATA_V1)},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": GROUP_MEMORY_LONG, "metadata": json.dumps(GROUP_METADATA_V1)},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -190,13 +198,16 @@ async def test_migrate_group_chat_legacy_record(tmp_path):
 async def test_migrate_null_metadata_record(tmp_path):
     """metadata 为 NULL 的旧记录迁移后应正确补充字段。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": "用户说了一些话", "metadata": None},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": "用户说了一些话", "metadata": None},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -208,13 +219,16 @@ async def test_migrate_null_metadata_record(tmp_path):
 async def test_migrate_empty_string_metadata_record(tmp_path):
     """metadata 为空字符串的旧记录迁移后应正确补充字段。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": "用户说了一些话", "metadata": ""},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": "用户说了一些话", "metadata": ""},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -225,13 +239,16 @@ async def test_migrate_empty_string_metadata_record(tmp_path):
 async def test_migrate_v2_record_not_overwritten(tmp_path):
     """已有 summary_schema_version=v2 的新记录不应被迁移覆盖。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V2)},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V2)},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -244,16 +261,33 @@ async def test_migrate_v2_record_not_overwritten(tmp_path):
 async def test_migrate_mixed_private_and_group_records(tmp_path):
     """私聊和群聊旧记录混合时，全部正确迁移。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
-        {"text": GROUP_MEMORY_LONG, "metadata": json.dumps(GROUP_METADATA_V1)},
-        {"text": "另一条私聊记忆", "metadata": json.dumps({"importance": 0.5, "interaction_type": "private_chat"})},
-        {"text": "另一条群聊记忆", "metadata": json.dumps({"importance": 0.6, "interaction_type": "group_chat", "participants": ["用户A"]})},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
+            {"text": GROUP_MEMORY_LONG, "metadata": json.dumps(GROUP_METADATA_V1)},
+            {
+                "text": "另一条私聊记忆",
+                "metadata": json.dumps(
+                    {"importance": 0.5, "interaction_type": "private_chat"}
+                ),
+            },
+            {
+                "text": "另一条群聊记忆",
+                "metadata": json.dumps(
+                    {
+                        "importance": 0.6,
+                        "interaction_type": "group_chat",
+                        "participants": ["用户A"],
+                    }
+                ),
+            },
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     assert len(records) == 4
@@ -266,14 +300,17 @@ async def test_migrate_mixed_private_and_group_records(tmp_path):
 async def test_migrate_idempotent(tmp_path):
     """重复执行迁移不改变已迁移数据，字段不重复。"""
     db_path = str(tmp_path / "test.db")
-    await _create_legacy_db(db_path, [
-        {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
-    ])
+    await _create_legacy_db(
+        db_path,
+        [
+            {"text": PRIVATE_MEMORY_LONG, "metadata": json.dumps(PRIVATE_METADATA_V1)},
+        ],
+    )
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     meta = records[0]["metadata"]
@@ -288,15 +325,23 @@ async def test_full_migration_v1_to_v4_with_real_data(tmp_path):
     db_path = str(tmp_path / "test.db")
     rows = []
     for i in range(3):
-        rows.append({
-            "text": PRIVATE_MEMORY_LONG + f"（第{i+1}次对话）",
-            "metadata": json.dumps({**PRIVATE_METADATA_V1, "importance": round(0.7 + i * 0.05, 2)}),
-        })
+        rows.append(
+            {
+                "text": PRIVATE_MEMORY_LONG + f"（第{i + 1}次对话）",
+                "metadata": json.dumps(
+                    {**PRIVATE_METADATA_V1, "importance": round(0.7 + i * 0.05, 2)}
+                ),
+            }
+        )
     for i in range(3):
-        rows.append({
-            "text": GROUP_MEMORY_LONG + f"（第{i+1}次群聊）",
-            "metadata": json.dumps({**GROUP_METADATA_V1, "importance": round(0.6 + i * 0.05, 2)}),
-        })
+        rows.append(
+            {
+                "text": GROUP_MEMORY_LONG + f"（第{i + 1}次群聊）",
+                "metadata": json.dumps(
+                    {**GROUP_METADATA_V1, "importance": round(0.6 + i * 0.05, 2)}
+                ),
+            }
+        )
     await _create_legacy_db(db_path, rows)
 
     migration = DBMigration(db_path)
@@ -317,43 +362,228 @@ async def test_bulk_migration_100_records(tmp_path):
     db_path = str(tmp_path / "bulk.db")
     rows = []
     for i in range(50):
-        rows.append({
-            "text": f"私聊记忆内容 {i}：" + "用户描述了详细的个人信息和偏好。" * 5,
-            "metadata": json.dumps({
-                "importance": round(0.3 + (i % 7) * 0.1, 1),
-                "topics": [f"话题{i}", "日常"],
-                "key_facts": [f"事实{i}A", f"事实{i}B"],
-                "interaction_type": "private_chat",
-                "session_id": f"aiocqhttp:FriendMessage:{10000 + i}",
-            }),
-        })
+        rows.append(
+            {
+                "text": f"私聊记忆内容 {i}：" + "用户描述了详细的个人信息和偏好。" * 5,
+                "metadata": json.dumps(
+                    {
+                        "importance": round(0.3 + (i % 7) * 0.1, 1),
+                        "topics": [f"话题{i}", "日常"],
+                        "key_facts": [f"事实{i}A", f"事实{i}B"],
+                        "interaction_type": "private_chat",
+                        "session_id": f"aiocqhttp:FriendMessage:{10000 + i}",
+                    }
+                ),
+            }
+        )
     for i in range(50):
-        rows.append({
-            "text": f"群聊记忆内容 {i}：" + "群成员讨论了各种话题，达成了一些共识。" * 5,
-            "metadata": json.dumps({
-                "importance": round(0.4 + (i % 6) * 0.1, 1),
-                "topics": [f"群话题{i}"],
-                "key_facts": [f"群事实{i}"],
-                "participants": [f"成员{i}A", f"成员{i}B"],
-                "interaction_type": "group_chat",
-                "session_id": f"aiocqhttp:GroupMessage:{88000 + i}",
-            }),
-        })
+        rows.append(
+            {
+                "text": f"群聊记忆内容 {i}："
+                + "群成员讨论了各种话题，达成了一些共识。" * 5,
+                "metadata": json.dumps(
+                    {
+                        "importance": round(0.4 + (i % 6) * 0.1, 1),
+                        "topics": [f"群话题{i}"],
+                        "key_facts": [f"群事实{i}"],
+                        "participants": [f"成员{i}A", f"成员{i}B"],
+                        "interaction_type": "group_chat",
+                        "session_id": f"aiocqhttp:GroupMessage:{88000 + i}",
+                    }
+                ),
+            }
+        )
     await _create_legacy_db(db_path, rows)
 
     migration = DBMigration(db_path)
     await migration.initialize_version_table()
-    await migration._migrate_v3_to_v4(None, None)
+    await migration._migrate_v3_to_v4(None)
 
     records = await _get_all_metadata(db_path)
     assert len(records) == 100
-    v1_count = sum(1 for r in records if r["metadata"].get("summary_schema_version") == "v1")
+    v1_count = sum(
+        1 for r in records if r["metadata"].get("summary_schema_version") == "v1"
+    )
     assert v1_count == 100
+
+
+@pytest.mark.asyncio
+async def test_migrate_v5_to_v6_renames_plugin_fts_tables(tmp_path):
+    db_path = str(tmp_path / "fts_prefix.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE VIRTUAL TABLE memories_fts
+            USING fts5(content, doc_id UNINDEXED, tokenize='unicode61')
+        """)
+        await db.execute("""
+            CREATE VIRTUAL TABLE graph_entries_fts
+            USING fts5(content, entry_id UNINDEXED, tokenize='unicode61')
+        """)
+        await db.execute(
+            "INSERT INTO memories_fts(doc_id, content) VALUES (?, ?)",
+            (1, "旧文档索引"),
+        )
+        await db.execute(
+            "INSERT INTO graph_entries_fts(entry_id, content) VALUES (?, ?)",
+            (2, "旧图索引"),
+        )
+        await db.commit()
+
+    migration = DBMigration(db_path)
+    await migration._migrate_v5_to_v6(None)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM livingmemory_memories_fts")
+        memory_count = await cursor.fetchone()
+        cursor = await db.execute("SELECT COUNT(*) FROM livingmemory_graph_entries_fts")
+        graph_count = await cursor.fetchone()
+        cursor = await db.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN ('memories_fts', 'graph_entries_fts')
+        """)
+        old_tables = await cursor.fetchall()
+
+    assert memory_count is not None
+    assert memory_count[0] == 1
+    assert graph_count is not None
+    assert graph_count[0] == 1
+    assert old_tables == []
+
+
+@pytest.mark.asyncio
+async def test_migrate_v5_to_v6_keeps_astrbot_documents_fts(tmp_path):
+    db_path = str(tmp_path / "host_fts.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE VIRTUAL TABLE documents_fts
+            USING fts5(content, doc_id UNINDEXED, tokenize='unicode61')
+        """)
+        await db.execute(
+            "INSERT INTO documents_fts(doc_id, content) VALUES (?, ?)",
+            (10, "宿主索引"),
+        )
+        await db.commit()
+
+    migration = DBMigration(db_path)
+    await migration._migrate_v5_to_v6(None)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM documents_fts")
+        host_count = await cursor.fetchone()
+        cursor = await db.execute("SELECT COUNT(*) FROM livingmemory_memories_fts")
+        plugin_count = await cursor.fetchone()
+
+    assert host_count is not None
+    assert host_count[0] == 1
+    assert plugin_count is not None
+    assert plugin_count[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_v5_to_v6_backs_up_exact_legacy_documents_fts(tmp_path):
+    db_path = str(tmp_path / "legacy_documents_fts.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE VIRTUAL TABLE documents_fts
+            USING fts5(content, doc_id, tokenize='unicode61')
+        """)
+        await db.execute(
+            "INSERT INTO documents_fts(doc_id, content) VALUES (?, ?)",
+            (10, "旧稀疏索引"),
+        )
+        await db.commit()
+
+    migration = DBMigration(db_path)
+    await migration._migrate_v5_to_v6(None)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='documents_fts'
+        """)
+        old_table = await cursor.fetchone()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM livingmemory_legacy_documents_fts_backup"
+        )
+        backup_count = await cursor.fetchone()
+
+    assert old_table is None
+    assert backup_count is not None
+    assert backup_count[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_migrate_v5_to_v6_keeps_non_exact_documents_fts(tmp_path):
+    db_path = str(tmp_path / "unknown_documents_fts.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE VIRTUAL TABLE documents_fts
+            USING fts5(search_text, doc_id UNINDEXED, tokenize='unicode61')
+        """)
+        await db.execute(
+            "INSERT INTO documents_fts(doc_id, search_text) VALUES (?, ?)",
+            (20, "非旧 LivingMemory 精确结构索引"),
+        )
+        await db.commit()
+
+    migration = DBMigration(db_path)
+    await migration._migrate_v5_to_v6(None)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM documents_fts")
+        existing_count = await cursor.fetchone()
+        cursor = await db.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='livingmemory_legacy_documents_fts_backup'
+        """)
+        backup_table = await cursor.fetchone()
+
+    assert existing_count is not None
+    assert existing_count[0] == 1
+    assert backup_table is None
+
+
+@pytest.mark.asyncio
+async def test_migrate_v7_to_v8_creates_write_ops_and_access_metadata(tmp_path):
+    db_path = str(tmp_path / "v8.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}'
+            )
+        """)
+        await db.execute(
+            "INSERT INTO documents(text, metadata) VALUES (?, ?)",
+            ("测试记忆", json.dumps({"importance": 0.5, "persona_id": "p1"})),
+        )
+        await db.commit()
+
+    migration = DBMigration(db_path)
+    await migration._migrate_v7_to_v8(None)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='memory_write_ops'
+        """)
+        assert await cursor.fetchone() is not None
+        cursor = await db.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='index' AND name='idx_doc_persona_metadata'
+        """)
+        assert await cursor.fetchone() is not None
+        cursor = await db.execute("SELECT metadata FROM documents WHERE id = 1")
+        row = await cursor.fetchone()
+
+    assert json.loads(row[0])["access_count"] == 0
 
 
 # ===========================================================================
 # 二、迁移后注入效果测试
 # ===========================================================================
+
 
 def test_format_injection_private_chat_v1_legacy():
     """私聊旧数据（v1）注入格式化：content 被正确展示，key_facts 和 topics 可见。"""
@@ -362,14 +592,18 @@ def test_format_injection_private_chat_v1_legacy():
             "content": PRIVATE_MEMORY_LONG,
             "score": 0.88,
             "timestamp": time.time() - 86400 * 15,
-            "metadata": {**PRIVATE_METADATA_V1, "summary_schema_version": "v1", "summary_quality": "unknown"},
+            "metadata": {
+                **PRIVATE_METADATA_V1,
+                "summary_schema_version": "v1",
+                "summary_quality": "unknown",
+            },
         },
     ]
     result = format_memories_for_injection(memories)
 
     assert result != ""
     assert "后端工程师" in result
-    assert "工作" in result          # topics
+    assert "工作" in result  # topics
     assert "后端工程师，使用 Python 和 Go" in result  # key_facts
 
 
@@ -380,14 +614,18 @@ def test_format_injection_group_chat_v1_legacy():
             "content": GROUP_MEMORY_LONG,
             "score": 0.82,
             "timestamp": time.time() - 86400 * 7,
-            "metadata": {**GROUP_METADATA_V1, "summary_schema_version": "v1", "summary_quality": "unknown"},
+            "metadata": {
+                **GROUP_METADATA_V1,
+                "summary_schema_version": "v1",
+                "summary_quality": "unknown",
+            },
         },
     ]
     result = format_memories_for_injection(memories)
 
     assert result != ""
-    assert "张三" in result          # participants
-    assert "AI工具" in result        # topics
+    assert "张三" in result  # participants
+    assert "AI工具" in result  # topics
     assert "建议公司内部部署私有化 LLM" in result  # key_facts
 
 
@@ -395,7 +633,9 @@ def test_format_injection_private_chat_v2_new():
     """私聊新数据（v2）注入格式化：canonical_summary 内容通过 content 字段展示。"""
     memories = [
         {
-            "content": PRIVATE_METADATA_V2["canonical_summary"] + " | " + "；".join(PRIVATE_METADATA_V2["key_facts"][:5]),
+            "content": PRIVATE_METADATA_V2["canonical_summary"]
+            + " | "
+            + "；".join(PRIVATE_METADATA_V2["key_facts"][:5]),
             "score": 0.95,
             "timestamp": time.time() - 3600,
             "metadata": PRIVATE_METADATA_V2,
@@ -412,7 +652,9 @@ def test_format_injection_group_chat_v2_new():
     """群聊新数据（v2）注入格式化：participants 和 key_facts 均展示。"""
     memories = [
         {
-            "content": GROUP_METADATA_V2["canonical_summary"] + " | " + "；".join(GROUP_METADATA_V2["key_facts"][:5]),
+            "content": GROUP_METADATA_V2["canonical_summary"]
+            + " | "
+            + "；".join(GROUP_METADATA_V2["key_facts"][:5]),
             "score": 0.91,
             "timestamp": time.time() - 7200,
             "metadata": GROUP_METADATA_V2,
@@ -448,14 +690,22 @@ def test_format_injection_mixed_v1_v2_private_and_group():
             "content": PRIVATE_MEMORY_LONG,
             "score": 0.75,
             "timestamp": now - 86400 * 30,
-            "metadata": {**PRIVATE_METADATA_V1, "summary_schema_version": "v1", "summary_quality": "unknown"},
+            "metadata": {
+                **PRIVATE_METADATA_V1,
+                "summary_schema_version": "v1",
+                "summary_quality": "unknown",
+            },
         },
         # 群聊 v1（旧数据）
         {
             "content": GROUP_MEMORY_LONG,
             "score": 0.70,
             "timestamp": now - 86400 * 60,
-            "metadata": {**GROUP_METADATA_V1, "summary_schema_version": "v1", "summary_quality": "unknown"},
+            "metadata": {
+                **GROUP_METADATA_V1,
+                "summary_schema_version": "v1",
+                "summary_quality": "unknown",
+            },
         },
         # 极旧数据（无 schema_version）
         {

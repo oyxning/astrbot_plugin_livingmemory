@@ -3,6 +3,8 @@
 负责管理会话和消息的持久化存储,使用 SQLite 数据库
 """
 
+import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -32,6 +34,7 @@ class ConversationStore:
         """
         self.db_path = db_path
         self.connection: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
 
         # 确保数据库目录存在
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -41,6 +44,8 @@ class ConversationStore:
         self.connection = await aiosqlite.connect(self.db_path)
         if self.connection is not None:
             self.connection.row_factory = aiosqlite.Row
+            await self.connection.execute("PRAGMA journal_mode = WAL")
+            await self.connection.execute("PRAGMA busy_timeout = 10000")
 
         await self._create_tables()
         await self._create_indexes()
@@ -51,6 +56,7 @@ class ConversationStore:
         """关闭数据库连接"""
         if self.connection:
             await self.connection.close()
+            self.connection = None
             logger.info("[ConversationStore] 数据库连接已关闭")
 
     async def _create_tables(self) -> None:
@@ -110,6 +116,9 @@ class ConversationStore:
             await self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_msg_timestamp ON messages(timestamp DESC)"
             )
+            await self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_msg_session_id ON messages(session_id, id)"
+            )
 
             await self.connection.commit()
 
@@ -138,15 +147,15 @@ class ConversationStore:
 
         if self.connection is None:
             raise RuntimeError("数据库连接未初始化")
-        cursor = await self.connection.execute(
-            """
-            INSERT INTO sessions (session_id, platform, created_at, last_active_at, message_count, participants, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            (session_id, platform, now, now, 0, "[]", "{}"),
-        )
-
-        await self.connection.commit()
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                INSERT INTO sessions (session_id, platform, created_at, last_active_at, message_count, participants, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+                (session_id, platform, now, now, 0, "[]", "{}"),
+            )
+            await self.connection.commit()
 
         session = Session(
             id=cursor.lastrowid if cursor.lastrowid else 0,
@@ -212,16 +221,16 @@ class ConversationStore:
 
         if self.connection is None:
             return
-        await self.connection.execute(
-            """
-            UPDATE sessions
-            SET last_active_at = ?
-            WHERE session_id = ?
-        """,
-            (now, session_id),
-        )
-
-        await self.connection.commit()
+        async with self._write_lock:
+            await self.connection.execute(
+                """
+                UPDATE sessions
+                SET last_active_at = ?
+                WHERE session_id = ?
+            """,
+                (now, session_id),
+            )
+            await self.connection.commit()
 
     async def get_recent_sessions(self, limit: int = 10) -> list[Session]:
         """
@@ -288,32 +297,35 @@ class ConversationStore:
 
         if self.connection is None:
             return 0
-        # 获取要删除的会话ID列表
-        async with self.connection.execute(
-            """
-            SELECT session_id FROM sessions
-            WHERE last_active_at < ?
-        """,
-            (cutoff_time,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            session_ids = [row["session_id"] for row in rows]
+        async with self._write_lock:
+            # 获取要删除的会话ID列表
+            async with self.connection.execute(
+                """
+                SELECT session_id FROM sessions
+                WHERE last_active_at < ?
+            """,
+                (cutoff_time,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                session_ids = [row["session_id"] for row in rows]
 
-        if not session_ids:
-            return 0
+            if not session_ids:
+                return 0
 
-        # 删除这些会话的所有消息
-        placeholders = ",".join("?" * len(session_ids))
-        await self.connection.execute(
-            f"DELETE FROM messages WHERE session_id IN ({placeholders})", session_ids
-        )
+            # 删除这些会话的所有消息
+            placeholders = ",".join("?" * len(session_ids))
+            await self.connection.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
 
-        # 删除会话记录
-        await self.connection.execute(
-            f"DELETE FROM sessions WHERE session_id IN ({placeholders})", session_ids
-        )
+            # 删除会话记录
+            await self.connection.execute(
+                f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
 
-        await self.connection.commit()
+            await self.connection.commit()
 
         logger.info(
             f"[ConversationStore] 删除了 {len(session_ids)} 个过期会话 "
@@ -344,24 +356,40 @@ class ConversationStore:
             session_id: 会话ID
             sender_id: 发送者ID
         """
-        session = await self.get_session(session_id)
-        if not session:
+        if self.connection is None:
             return
 
-        if sender_id not in session.participants:
-            session.participants.append(sender_id)
+        async with self._write_lock:
+            async with self.connection.execute(
+                "SELECT participants FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
 
-            if self.connection is not None:
-                await self.connection.execute(
-                    """
-                    UPDATE sessions
-                    SET participants = ?
-                    WHERE session_id = ?
-                """,
-                    (serialize_to_json(session.participants), session_id),
-                )
+            if not row:
+                return
 
-                await self.connection.commit()
+            try:
+                participants = json.loads(row["participants"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                participants = []
+            if not isinstance(participants, list):
+                participants = []
+
+            if sender_id in participants:
+                return
+
+            participants.append(sender_id)
+            await self.connection.execute(
+                """
+                UPDATE sessions
+                SET participants = ?
+                WHERE session_id = ?
+            """,
+                (serialize_to_json(participants), session_id),
+            )
+
+            await self.connection.commit()
 
     # ==================== 消息管理 ====================
 
@@ -375,55 +403,84 @@ class ConversationStore:
         Returns:
             int: 消息ID
         """
-        # 确保会话存在
-        session = await self.get_session(message.session_id)
-        if not session:
-            # 自动创建会话
-            platform = message.platform or "unknown"
-            session = await self.create_session(message.session_id, platform)
-
         if self.connection is None:
             raise RuntimeError("数据库连接未初始化")
-        # 插入消息
-        cursor = await self.connection.execute(
-            """
-            INSERT INTO messages (
-                session_id, role, content, sender_id, sender_name,
-                group_id, platform, timestamp, metadata
+
+        platform = message.platform or "unknown"
+        if not isinstance(platform, str):
+            platform = getattr(platform, "name", str(platform))
+            logger.warning(
+                f"[add_message] platform 参数不是字符串类型，已自动转换为: {platform}"
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                message.session_id,
-                message.role,
-                message.content,
-                message.sender_id,
-                message.sender_name,
-                message.group_id,
-                message.platform,
-                message.timestamp,
-                serialize_to_json(message.metadata),
-            ),
-        )
 
-        message_id = cursor.lastrowid if cursor.lastrowid else 0
+        sender_id = message.sender_id or message.session_id
+        content = Message.content_to_text(message.content)
+        now = time.time()
+        async with self._write_lock:
+            await self.connection.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, platform, created_at, last_active_at,
+                    message_count, participants, metadata
+                )
+                VALUES (?, ?, ?, ?, 0, '[]', '{}')
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (message.session_id, platform, now, message.timestamp),
+            )
 
-        # 更新会话统计
-        await self.connection.execute(
-            """
-            UPDATE sessions
-            SET message_count = message_count + 1,
-                last_active_at = ?
-            WHERE session_id = ?
-        """,
-            (message.timestamp, message.session_id),
-        )
+            cursor = await self.connection.execute(
+                """
+                INSERT INTO messages (
+                    session_id, role, content, sender_id, sender_name,
+                    group_id, platform, timestamp, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    message.session_id,
+                    message.role,
+                    content,
+                    sender_id,
+                    message.sender_name,
+                    message.group_id,
+                    platform,
+                    message.timestamp,
+                    serialize_to_json(message.metadata),
+                ),
+            )
 
-        # 添加参与者
-        if message.sender_id:
-            await self.add_session_participant(message.session_id, message.sender_id)
+            message_id = cursor.lastrowid if cursor.lastrowid else 0
 
-        await self.connection.commit()
+            await self.connection.execute(
+                """
+                UPDATE sessions
+                SET message_count = message_count + 1,
+                    last_active_at = ?,
+                    participants = CASE
+                        WHEN ? = '' THEN participants
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM json_each(COALESCE(NULLIF(participants, ''), '[]'))
+                            WHERE value = ?
+                        ) THEN participants
+                        ELSE json_insert(
+                            COALESCE(NULLIF(participants, ''), '[]'),
+                            '$[#]',
+                            ?
+                        )
+                    END
+                WHERE session_id = ?
+            """,
+                (
+                    message.timestamp,
+                    sender_id,
+                    sender_id,
+                    sender_id,
+                    message.session_id,
+                ),
+            )
+            await self.connection.commit()
 
         logger.debug(
             f"[ConversationStore] 添加消息: session={message.session_id}, role={message.role}"
@@ -521,6 +578,110 @@ class ConversationStore:
                 return int(count_value) if count_value is not None else 0
             return 0
 
+    async def trim_session_messages(
+        self,
+        session_id: str,
+        delete_count: int,
+    ) -> int:
+        """Delete only summarized oldest messages and refresh the session count."""
+        if self.connection is None or delete_count <= 0:
+            return 0
+
+        async with self.connection.execute(
+            """
+            SELECT
+                s.metadata,
+                COUNT(m.id) AS actual_count
+            FROM sessions s
+            LEFT JOIN messages m ON m.session_id = s.session_id
+            WHERE s.session_id = ?
+            GROUP BY s.session_id
+            """,
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return 0
+
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        try:
+            last_summarized_index = int(metadata.get("last_summarized_index", 0) or 0)
+        except (TypeError, ValueError):
+            last_summarized_index = 0
+        last_summarized_index = max(0, last_summarized_index)
+
+        actual_count = int(row["actual_count"] or 0)
+
+        if last_summarized_index > actual_count:
+            metadata["last_summarized_index"] = 0
+            async with self._write_lock:
+                await self.connection.execute(
+                    """
+                    UPDATE sessions
+                    SET metadata = ?,
+                        message_count = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        json.dumps(metadata, ensure_ascii=False),
+                        actual_count,
+                        session_id,
+                    ),
+                )
+                await self.connection.commit()
+            logger.warning(
+                f"[ConversationStore] 阻止清理未总结消息并重置 last_summarized_index: "
+                f"{session_id} ({last_summarized_index} > {actual_count})"
+            )
+            return 0
+
+        safe_delete_count = min(delete_count, last_summarized_index)
+        if safe_delete_count <= 0:
+            return 0
+
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                DELETE FROM messages
+                WHERE id IN (
+                    SELECT id FROM messages
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC, id ASC
+                    LIMIT ?
+                )
+                """,
+                (session_id, safe_delete_count),
+            )
+            deleted_count = max(0, cursor.rowcount)
+            if deleted_count <= 0:
+                return 0
+
+            metadata["last_summarized_index"] = max(
+                0, last_summarized_index - deleted_count
+            )
+            await self.connection.execute(
+                """
+                UPDATE sessions
+                SET message_count = ?,
+                    metadata = ?
+                WHERE session_id = ?
+                """,
+                (
+                    max(0, actual_count - deleted_count),
+                    json.dumps(metadata, ensure_ascii=False),
+                    session_id,
+                ),
+            )
+            await self.connection.commit()
+        return deleted_count
+
     async def delete_session_messages(self, session_id: str) -> int:
         """
         删除会话的所有消息
@@ -533,27 +694,26 @@ class ConversationStore:
         """
         if self.connection is None:
             return 0
-        cursor = await self.connection.execute(
-            """
-            DELETE FROM messages
-            WHERE session_id = ?
-        """,
-            (session_id,),
-        )
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                DELETE FROM messages
+                WHERE session_id = ?
+            """,
+                (session_id,),
+            )
 
-        deleted_count = cursor.rowcount
+            deleted_count = cursor.rowcount
 
-        # 重置会话的消息计数
-        await self.connection.execute(
-            """
-            UPDATE sessions
-            SET message_count = 0
-            WHERE session_id = ?
-        """,
-            (session_id,),
-        )
-
-        await self.connection.commit()
+            await self.connection.execute(
+                """
+                UPDATE sessions
+                SET message_count = 0
+                WHERE session_id = ?
+            """,
+                (session_id,),
+            )
+            await self.connection.commit()
 
         logger.info(
             f"[ConversationStore] 删除会话消息: session={session_id}, count={deleted_count}"
@@ -608,15 +768,16 @@ class ConversationStore:
         try:
             import json
 
-            await self.connection.execute(
-                """
-                UPDATE messages
-                SET metadata = ?
-                WHERE id = ?
-                """,
-                (json.dumps(metadata, ensure_ascii=False), message_id),
-            )
-            await self.connection.commit()
+            async with self._write_lock:
+                await self.connection.execute(
+                    """
+                    UPDATE messages
+                    SET metadata = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(metadata, ensure_ascii=False), message_id),
+                )
+                await self.connection.commit()
             logger.debug(f"[ConversationStore] 更新消息metadata: id={message_id}")
             return True
         except Exception as e:
@@ -746,21 +907,24 @@ class ConversationStore:
         fixed_sessions = {}
 
         try:
-            # 获取所有会话及其记录的 message_count
-            async with self.connection.execute(
-                "SELECT session_id, message_count FROM sessions"
-            ) as cursor:
-                sessions = await cursor.fetchall()
+            async with self._write_lock:
+                async with self.connection.execute(
+                    """
+                    SELECT s.session_id,
+                           s.message_count AS recorded_count,
+                           COUNT(m.id) AS actual_count
+                    FROM sessions s
+                    LEFT JOIN messages m ON m.session_id = s.session_id
+                    GROUP BY s.session_id
+                    HAVING s.message_count != COUNT(m.id)
+                    """
+                ) as cursor:
+                    rows = await cursor.fetchall()
 
-            for session_row in sessions:
-                session_id = session_row["session_id"]
-                recorded_count = session_row["message_count"]
-
-                # 获取实际消息数量
-                actual_count = await self.get_message_count(session_id)
-
-                # 如果不一致，进行修复
-                if recorded_count != actual_count:
+                for row in rows:
+                    session_id = row["session_id"]
+                    recorded_count = row["recorded_count"]
+                    actual_count = int(row["actual_count"] or 0)
                     await self.connection.execute(
                         """
                         UPDATE sessions
@@ -775,15 +939,15 @@ class ConversationStore:
                         f"{session_id} ({recorded_count} -> {actual_count})"
                     )
 
-            if fixed_sessions:
-                await self.connection.commit()
-                logger.info(
-                    f"[ConversationStore] 共修复 {len(fixed_sessions)} 个会话的 message_count"
-                )
-            else:
-                logger.info(
-                    "[ConversationStore] 所有会话的 message_count 均正确，无需修复"
-                )
+                if fixed_sessions:
+                    await self.connection.commit()
+                    logger.info(
+                        f"[ConversationStore] 共修复 {len(fixed_sessions)} 个会话的 message_count"
+                    )
+                else:
+                    logger.info(
+                        "[ConversationStore] 所有会话的 message_count 均正确，无需修复"
+                    )
 
             return fixed_sessions
 
@@ -805,41 +969,42 @@ class ConversationStore:
             return False
 
         try:
-            # 获取会话信息
-            async with self.connection.execute(
-                "SELECT metadata, message_count FROM sessions WHERE session_id = ?",
-                (session_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
+            async with self._write_lock:
+                # 获取会话信息
+                async with self.connection.execute(
+                    "SELECT metadata, message_count FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
 
-            if not row:
-                return False
+                if not row:
+                    return False
 
-            import json
+                import json
 
-            metadata_str = row["metadata"] or "{}"
-            metadata = json.loads(metadata_str)
-            message_count = row["message_count"]
+                metadata_str = row["metadata"] or "{}"
+                metadata = json.loads(metadata_str)
+                message_count = row["message_count"]
 
-            last_summarized_index = metadata.get("last_summarized_index", 0)
+                last_summarized_index = metadata.get("last_summarized_index", 0)
 
-            # 如果 last_summarized_index 超出实际消息数量，重置为0
-            if last_summarized_index > message_count:
-                metadata["last_summarized_index"] = 0
-                await self.connection.execute(
-                    """
-                    UPDATE sessions
-                    SET metadata = ?
-                    WHERE session_id = ?
-                    """,
-                    (json.dumps(metadata, ensure_ascii=False), session_id),
-                )
-                await self.connection.commit()
-                logger.warning(
-                    f"[ConversationStore] 重置 last_summarized_index: "
-                    f"{session_id} ({last_summarized_index} -> 0, 实际消息数={message_count})"
-                )
-                return True
+                # 如果 last_summarized_index 超出实际消息数量，重置为0
+                if last_summarized_index > message_count:
+                    metadata["last_summarized_index"] = 0
+                    await self.connection.execute(
+                        """
+                        UPDATE sessions
+                        SET metadata = ?
+                        WHERE session_id = ?
+                        """,
+                        (json.dumps(metadata, ensure_ascii=False), session_id),
+                    )
+                    await self.connection.commit()
+                    logger.warning(
+                        f"[ConversationStore] 重置 last_summarized_index: "
+                        f"{session_id} ({last_summarized_index} -> 0, 实际消息数={message_count})"
+                    )
+                    return True
 
             return False
 
@@ -889,72 +1054,73 @@ class ConversationStore:
         }
 
         try:
-            # 构建查询条件
-            query = """
-                SELECT id, session_id, content
-                FROM messages
-                WHERE content LIKE ?
-            """
-            params = [f"%{MEMORY_INJECTION_HEADER}%"]
+            async with self._write_lock:
+                # 构建查询条件
+                query = """
+                    SELECT id, session_id, content
+                    FROM messages
+                    WHERE content LIKE ?
+                """
+                params = [f"%{MEMORY_INJECTION_HEADER}%"]
 
-            if session_id:
-                query += " AND session_id = ?"
-                params.append(session_id)
+                if session_id:
+                    query += " AND session_id = ?"
+                    params.append(session_id)
 
-            # 查询包含注入标记的消息
-            async with self.connection.execute(query, params) as cursor:
-                rows = await cursor.fetchall()
+                # 查询包含注入标记的消息
+                async with self.connection.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
 
-            # 转换为列表以确保类型兼容
-            rows_list = list(rows)
-            stats["scanned"] = len(rows_list)
+                # 转换为列表以确保类型兼容
+                rows_list = list(rows)
+                stats["scanned"] = len(rows_list)
 
-            for row in rows_list:
-                msg_id = row["id"]
-                msg_session = row["session_id"]
-                original_content = row["content"]
+                for row in rows_list:
+                    msg_id = row["id"]
+                    msg_session = row["session_id"]
+                    original_content = row["content"]
 
-                # 检查是否确实包含完整的注入标记
-                if (
-                    MEMORY_INJECTION_HEADER not in original_content
-                    or MEMORY_INJECTION_FOOTER not in original_content
-                ):
-                    continue
+                    # 检查是否确实包含完整的注入标记
+                    if (
+                        MEMORY_INJECTION_HEADER not in original_content
+                        or MEMORY_INJECTION_FOOTER not in original_content
+                    ):
+                        continue
 
-                stats["matched"] += 1
+                    stats["matched"] += 1
 
-                # 清理内容
-                cleaned_content = pattern.sub("", original_content)
-                cleaned_content = re.sub(r"\n{3,}", "\n\n", cleaned_content).strip()
+                    # 清理内容
+                    cleaned_content = pattern.sub("", original_content)
+                    cleaned_content = re.sub(r"\n{3,}", "\n\n", cleaned_content).strip()
 
-                # 如果清理后为空,删除消息
-                if not cleaned_content:
-                    if not dry_run:
-                        await self.connection.execute(
-                            "DELETE FROM messages WHERE id = ?", (msg_id,)
+                    # 如果清理后为空,删除消息
+                    if not cleaned_content:
+                        if not dry_run:
+                            await self.connection.execute(
+                                "DELETE FROM messages WHERE id = ?", (msg_id,)
+                            )
+                        stats["deleted"] += 1
+                        logger.debug(
+                            f"[cleanup_injected_memories] {'[DRY-RUN] ' if dry_run else ''}删除纯记忆消息: "
+                            f"id={msg_id}, session={msg_session}"
                         )
-                    stats["deleted"] += 1
-                    logger.debug(
-                        f"[cleanup_injected_memories] {'[DRY-RUN] ' if dry_run else ''}删除纯记忆消息: "
-                        f"id={msg_id}, session={msg_session}"
-                    )
-                    continue
+                        continue
 
-                # 如果清理后仍有内容,更新消息
-                if cleaned_content != original_content:
-                    if not dry_run:
-                        await self.connection.execute(
-                            "UPDATE messages SET content = ? WHERE id = ?",
-                            (cleaned_content, msg_id),
+                    # 如果清理后仍有内容,更新消息
+                    if cleaned_content != original_content:
+                        if not dry_run:
+                            await self.connection.execute(
+                                "UPDATE messages SET content = ? WHERE id = ?",
+                                (cleaned_content, msg_id),
+                            )
+                        stats["cleaned"] += 1
+                        logger.debug(
+                            f"[cleanup_injected_memories] {'[DRY-RUN] ' if dry_run else ''}清理消息: "
+                            f"id={msg_id}, 原长度={len(original_content)}, 新长度={len(cleaned_content)}"
                         )
-                    stats["cleaned"] += 1
-                    logger.debug(
-                        f"[cleanup_injected_memories] {'[DRY-RUN] ' if dry_run else ''}清理消息: "
-                        f"id={msg_id}, 原长度={len(original_content)}, 新长度={len(cleaned_content)}"
-                    )
 
-            if not dry_run:
-                await self.connection.commit()
+                if not dry_run:
+                    await self.connection.commit()
 
             logger.info(
                 f"[cleanup_injected_memories] {'[DRY-RUN] ' if dry_run else ''}清理完成: "

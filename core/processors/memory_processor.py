@@ -13,6 +13,8 @@ from typing import Any
 from astrbot.api import logger
 
 from ..models.conversation_models import Message
+from ..models.memory_atom import MemoryAtom
+from .atom_classifier import classify_atoms
 
 
 class MemoryProcessor:
@@ -23,19 +25,67 @@ class MemoryProcessor:
     支持私聊和群聊两种场景的不同处理策略。
     """
 
-    def __init__(self, llm_provider, context=None):
+    def __init__(
+        self,
+        context=None,
+        llm_provider: Any = None,
+        config: dict[str, Any] | None = None,
+    ):
         """
         初始化记忆处理器
 
         Args:
-            llm_provider: LLM提供者实例(Provider类型)
             context: AstrBot上下文,用于获取人格管理器
+            llm_provider: LLM Provider 实例或 Provider ID 字符串。
+                          传入实例时直接使用（测试用）；传入字符串时动态解析。
+                          留空则使用AstrBot默认Provider。
+            config: 记忆处理器配置。
         """
-        self.llm_provider = llm_provider
         self.context = context
+        self._llm_provider = llm_provider
+        self.config = config or {}
 
         # 加载提示词模板
         self._load_prompts()
+
+    def _get_current_llm_provider(self):
+        """动态解析LLM Provider以避免持有过期引用
+
+        AstrBot可能在运行期间重新创建Provider实例（例如配置变更后），
+        旧的Provider实例内部的httpx client会被关闭，导致
+        RuntimeError: Cannot send a request, as the client has been closed.
+        因此每次调用前都从AstrBot上下文重新获取当前有效的Provider。
+        """
+        if not self.context:
+            # 无 context 时直接返回传入的 provider 实例（测试路径）
+            if self._llm_provider is not None and not isinstance(
+                self._llm_provider, str
+            ):
+                return self._llm_provider
+            return None
+
+        # 如果传入的是 provider 实例（非字符串），直接使用（测试路径）
+        if self._llm_provider is not None and not isinstance(self._llm_provider, str):
+            return self._llm_provider
+
+        # 优先使用配置中指定的Provider ID（字符串）
+        if isinstance(self._llm_provider, str) and self._llm_provider:
+            try:
+                provider = self.context.get_provider_by_id(self._llm_provider)
+                if provider:
+                    return provider
+            except Exception:
+                pass
+
+        # 回退到AstrBot当前默认Provider
+        try:
+            provider = self.context.get_using_provider()
+            if provider:
+                return provider
+        except Exception:
+            pass
+
+        return None
 
     def _load_prompts(self) -> None:
         """从外部文件加载提示词模板"""
@@ -175,7 +225,10 @@ class MemoryProcessor:
         last_error = None
         for attempt in range(max_retries):
             try:
-                response = await self.llm_provider.text_chat(
+                provider = self._get_current_llm_provider()
+                if not provider:
+                    raise RuntimeError("LLM Provider 不可用")
+                response = await provider.text_chat(
                     prompt=prompt, system_prompt=system_prompt
                 )
                 return response.completion_text
@@ -241,7 +294,6 @@ class MemoryProcessor:
         self,
         messages: list[Message],
         is_group_chat: bool = False,
-        save_original: bool = False,
         persona_id: str | None = None,
     ) -> tuple[str, dict[str, Any], float]:
         """
@@ -250,7 +302,6 @@ class MemoryProcessor:
         Args:
             messages: 消息列表(Message对象)
             is_group_chat: 是否为群聊
-            save_original: 是否保存原始对话历史（默认False，只保存LLM生成的总结）
             persona_id: 人格ID,用于获取人格提示词
 
         Returns:
@@ -317,8 +368,13 @@ class MemoryProcessor:
             structured_data["_quality"] = quality
 
             # 5. 构建存储格式
+            fallback_excerpt = (
+                conversation_text[:200] + "..."
+                if len(conversation_text) > 200
+                else conversation_text
+            )
             content, metadata = self._build_storage_format(
-                conversation_text, structured_data, is_group_chat
+                fallback_excerpt, structured_data, is_group_chat
             )
             # 将质量标记写入 metadata
             metadata["summary_quality"] = structured_data.get("_quality", "normal")
@@ -360,37 +416,36 @@ class MemoryProcessor:
                 f"role={msg.role}, group_id={msg.group_id}"
             )
 
+            content_text = self._message_content_to_text(msg.content)
+            sender_info = self._format_sender_info(msg)
+            formatted_line = f"{sender_info} {content_text}".rstrip()
+            formatted_lines.append(formatted_line)
             if msg.group_id:
-                # 群聊场景：使用Message对象的format_for_llm方法
-                formatted = msg.format_for_llm(include_sender_name=True)
-                formatted_lines.append(formatted["content"])
                 logger.debug(
-                    f"[_format_conversation] 消息#{i} 格式化结果(群聊): {formatted['content'][:100]}..."
+                    f"[_format_conversation] 消息#{i} 格式化结果(群聊): {formatted_line[:100]}..."
                 )
             else:
-                # 私聊场景：也使用 [昵称 | ID: xxx | 时间] 格式
-                time_str = datetime.fromtimestamp(msg.timestamp).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                display_name = (
-                    msg.sender_name if msg.sender_name else msg.sender_id or "未知"
-                )
-                is_bot = (
-                    msg.metadata.get("is_bot_message", False) or msg.role == "assistant"
-                )
-
-                if is_bot:
-                    sender_info = (
-                        f"[Bot: {display_name} | ID: {msg.sender_id} | {time_str}]"
-                    )
-                else:
-                    sender_info = f"[{display_name} | ID: {msg.sender_id} | {time_str}]"
-
-                formatted_lines.append(f"{sender_info} {msg.content}")
                 logger.debug(
                     f"[_format_conversation] 消息#{i} 格式化结果(私聊): {sender_info[:50]}..."
                 )
         return "\n".join(formatted_lines)
+
+    @staticmethod
+    def _format_sender_info(msg: Message) -> str:
+        time_str = datetime.fromtimestamp(msg.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        display_name = msg.sender_name if msg.sender_name else msg.sender_id or "未知"
+        is_bot = msg.metadata.get("is_bot_message", False) or msg.role == "assistant"
+        if is_bot:
+            return f"[Bot: {display_name} | ID: {msg.sender_id} | {time_str}]"
+        return f"[{display_name} | ID: {msg.sender_id} | {time_str}]"
+
+    @classmethod
+    def _message_content_to_text(cls, content: Any) -> str:
+        return Message.content_to_text(content)
+
+    @classmethod
+    def _message_part_to_text(cls, part: Any) -> tuple[str, bool]:
+        return Message._content_part_to_text(part)
 
     def _parse_llm_response(
         self, response_text: str, is_group_chat: bool
@@ -616,7 +671,7 @@ class MemoryProcessor:
 
     def _build_storage_format(
         self,
-        conversation_text: str,
+        fallback_excerpt: str,
         structured_data: dict[str, Any],
         is_group_chat: bool,
     ) -> tuple[str, dict[str, Any]]:
@@ -624,7 +679,7 @@ class MemoryProcessor:
         构建存储格式
 
         Args:
-            conversation_text: 原始对话文本（已不再使用，保留参数以兼容旧代码）
+            fallback_excerpt: 当摘要为空时使用的对话摘录
             structured_data: 结构化数据
             is_group_chat: 是否为群聊
 
@@ -645,11 +700,7 @@ class MemoryProcessor:
         if canonical_summary:
             content = canonical_summary
         else:
-            content = (
-                conversation_text[:200] + "..."
-                if len(conversation_text) > 200
-                else conversation_text
-            )
+            content = fallback_excerpt
 
         # metadata字段:存储结构化信息
         # 注意：不要在这里设置 create_time 和 last_access_time
@@ -724,6 +775,31 @@ class MemoryProcessor:
         except (ValueError, TypeError):
             return 0.5
 
+    def build_memory_from_structured_data(
+        self,
+        structured_data: dict[str, Any],
+        is_group_chat: bool = False,
+        fallback_excerpt: str = "",
+    ) -> tuple[str, dict[str, Any], float]:
+        """复用自动总结流程，将结构化数据转换为标准记忆存储格式。"""
+        # 与自动总结路径保持一致：先校验质量，再规范化。
+        # 这样原始 importance 越界等异常仍会被判为 low quality。
+        quality = self._validate_summary_quality(structured_data)
+        normalized = self._normalize_parsed_data(structured_data, is_group_chat)
+        normalized["_quality"] = quality
+
+        content, metadata = self._build_storage_format(
+            fallback_excerpt or normalized.get("summary", ""),
+            normalized,
+            is_group_chat,
+        )
+        metadata["summary_quality"] = quality
+        return (
+            content,
+            metadata,
+            self._validate_importance(normalized.get("importance")),
+        )
+
     def _get_default_value(self, field: str) -> Any:
         """获取字段的默认值"""
         defaults = {
@@ -787,3 +863,31 @@ class MemoryProcessor:
             return "low"
 
         return "normal"
+
+    def classify_atoms_from_metadata(
+        self,
+        metadata: dict[str, Any],
+        parent_importance: float = 0.5,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+    ) -> list[MemoryAtom]:
+        """Generate time-aware memory atoms from key_facts in metadata.
+
+        This is a post-processing step after process_conversation().
+        It does NOT make additional LLM calls — classification is rule-based.
+        """
+        if not self.config.get("atom_enabled", True):
+            return []
+        key_facts: list[str] = metadata.get("key_facts", [])
+        if not key_facts:
+            return []
+        topics = metadata.get("topics", [])
+        participants = metadata.get("participants", [])
+        return classify_atoms(
+            key_facts=key_facts,
+            topics=topics,
+            participants=participants,
+            parent_importance=parent_importance,
+            session_id=session_id,
+            persona_id=persona_id,
+        )

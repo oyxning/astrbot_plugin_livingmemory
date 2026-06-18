@@ -6,6 +6,8 @@ from pathlib import Path
 
 from astrbot.api import logger
 
+from ..models.default_stopwords import DEFAULT_STOPWORDS
+
 
 class StopwordsManager:
     """停用词管理器"""
@@ -55,14 +57,13 @@ class StopwordsManager:
         # 1. 加载标准停用词表
         if source == "hit":
             # 从仓库内置目录加载
-            filename = f"stopwords_{source}.txt"
-            filepath = self.builtin_stopwords_dir / filename
-
-            if filepath.exists():
+            stopwords_path = await self.get_stopwords(source)
+            filepath = Path(stopwords_path) if stopwords_path else None
+            if filepath and filepath.exists():
                 self.stopwords = await self._load_from_file(filepath)
                 logger.info(f"从内置目录加载停用词: {filepath}")
             else:
-                logger.warning(f"内置停用词文件不存在: {filepath}，使用后备停用词")
+                logger.warning("内置停用词文件不可用，使用后备停用词")
                 self.stopwords = self._get_builtin_stopwords()
         else:
             # 使用自定义文件路径
@@ -116,160 +117,7 @@ class StopwordsManager:
         Returns:
             Set[str]: 基础停用词集合
         """
-        # 精简的核心停用词列表
-        builtin = {
-            # 代词
-            "我",
-            "你",
-            "他",
-            "她",
-            "它",
-            "我们",
-            "你们",
-            "他们",
-            "她们",
-            "它们",
-            "自己",
-            "自家",
-            "咱",
-            "咱们",
-            "这",
-            "那",
-            "这个",
-            "那个",
-            "这些",
-            "那些",
-            # 助词
-            "的",
-            "了",
-            "着",
-            "过",
-            "地",
-            "得",
-            "呢",
-            "吗",
-            "吧",
-            "啊",
-            "呀",
-            # 连词
-            "和",
-            "与",
-            "及",
-            "以及",
-            "或",
-            "或者",
-            "还是",
-            "而",
-            "且",
-            "并",
-            "但",
-            "但是",
-            "然而",
-            "可是",
-            "不过",
-            "而且",
-            "并且",
-            # 介词
-            "在",
-            "从",
-            "向",
-            "往",
-            "到",
-            "由",
-            "为",
-            "对",
-            "关于",
-            "按照",
-            "根据",
-            "通过",
-            "经过",
-            "沿着",
-            "朝",
-            "通过",
-            # 副词
-            "很",
-            "太",
-            "非常",
-            "极",
-            "十分",
-            "最",
-            "更",
-            "挺",
-            "特别",
-            "尤其",
-            "都",
-            "也",
-            "还",
-            "再",
-            "又",
-            "就",
-            "才",
-            "已",
-            "曾",
-            "已经",
-            "正在",
-            "将",
-            "将要",
-            "总是",
-            "一直",
-            "从来",
-            # 量词
-            "个",
-            "只",
-            "件",
-            "条",
-            "张",
-            "把",
-            "块",
-            "片",
-            "次",
-            "遍",
-            "些",
-            "点",
-            "下",
-            "回",
-            "趟",
-            # 叹词
-            "哦",
-            "啊",
-            "呀",
-            "哎",
-            "唉",
-            "嗯",
-            "哼",
-            "嘿",
-            # 其他虚词
-            "是",
-            "有",
-            "没",
-            "没有",
-            "不",
-            "没",
-            "别",
-            "莫",
-            "等",
-            "等等",
-            "之",
-            "所",
-            "其",
-            "此",
-            "于",
-            "让",
-            "被",
-            "把",
-            "给",
-            # 标点和符号（处理后的）
-            "、",
-            "，",
-            "。",
-            "！",
-            "？",
-            "；",
-            "：",
-            "……",
-            "—",
-        }
-
+        builtin = set(DEFAULT_STOPWORDS)
         logger.warning(f"使用内置停用词表（后备方案），共 {len(builtin)} 个词")
         return builtin
 
@@ -352,7 +200,8 @@ class StopwordsManager:
         """
         获取停用词文件路径。
 
-        从仓库内置目录返回停用词文件路径。
+        优先返回仓库内置停用词文件；如果文件不存在，则在用户自定义目录
+        写入一份内置后备停用词，避免调用方拿到不存在的路径。
 
         Args:
             source: 停用词来源 ("hit")
@@ -367,12 +216,34 @@ class StopwordsManager:
             # 检查内置文件是否存在
             if filepath.exists():
                 return str(filepath)
-            else:
-                logger.warning(f"内置停用词文件不存在: {filepath}")
-                return None
+
+            logger.warning(f"内置停用词文件不存在: {filepath}")
+            if self.custom_stopwords_dir:
+                fallback_path = self.custom_stopwords_dir / filename
+                await self._write_fallback_stopwords(fallback_path)
+                return str(fallback_path)
+            return None
         except Exception as e:
             logger.error(f"获取停用词文件失败: {e}")
             return None
+
+    async def _write_fallback_stopwords(self, filepath: Path) -> None:
+        if filepath.exists():
+            return
+
+        try:
+            import aiofiles
+
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            words = sorted(self._get_builtin_stopwords())
+            async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
+                await f.write("# Generated fallback stopwords for LivingMemory\n")
+                for word in words:
+                    await f.write(f"{word}\n")
+            logger.info(f"已生成后备停用词文件: {filepath}")
+        except Exception as e:
+            logger.error(f"生成后备停用词文件失败: {e}")
+            raise
 
 
 # 全局单例

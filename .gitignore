@@ -88,6 +88,8 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+docs/.vitepress/dist/
+docs/.vitepress/cache/
 
 data/
 .claude/
@@ -106,3 +108,12 @@ docs/platform_metadata.md
 docs/plugin.md
 docs/star_metadata.md
 docs/star.md
+AGENTS.md
+
+# Local testing
+mock_server.py
+docs/WEBUI_DESIGN.md
+docs/WEBUI_REDESIGN_PLAN.md
+WEBUI_REFACTOR_PLAN.md
+PAGE_API_REFACTOR_PROGRESS.md
+SESSION_SUMMARY_*.md

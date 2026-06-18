@@ -2,10 +2,13 @@
 Tests for PluginInitializer state management and provider resolution.
 """
 
+import subprocess
 from unittest.mock import AsyncMock, Mock
 
+import astrbot_plugin_livingmemory.core.plugin_initializer as plugin_initializer_mod
 import pytest
 from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
+from astrbot_plugin_livingmemory.core.base.exceptions import InitializationError
 from astrbot_plugin_livingmemory.core.plugin_initializer import PluginInitializer
 
 
@@ -63,6 +66,30 @@ def test_initialize_providers_with_fallback(monkeypatch, mock_context, tmp_path)
 
     assert init.embedding_provider is emb
     assert init.llm_provider is llm
+
+
+def test_check_faiss_runtime_raises_actionable_error(monkeypatch, initializer):
+    result = subprocess.CompletedProcess(
+        args=[],
+        returncode=-4,
+        stdout="",
+        stderr="Illegal instruction",
+    )
+    monkeypatch.setattr(
+        plugin_initializer_mod.subprocess, "run", Mock(return_value=result)
+    )
+
+    with pytest.raises(InitializationError, match="FAISS 初始化失败"):
+        initializer._check_faiss_runtime()
+
+
+def test_load_faiss_vec_db_class_uses_patched_class(monkeypatch, initializer):
+    class FakeFaissVecDB:
+        pass
+
+    monkeypatch.setattr(plugin_initializer_mod, "FaissVecDB", FakeFaissVecDB)
+
+    assert initializer._load_faiss_vec_db_class() is FakeFaissVecDB
 
 
 @pytest.mark.asyncio
@@ -155,9 +182,10 @@ async def test_complete_initialization_wires_graph_db_and_engine_config(
             self.kwargs = kwargs
 
     class FakeMemoryProcessor:
-        def __init__(self, provider, context):
-            self.provider = provider
+        def __init__(self, context=None, llm_provider=None, **kwargs):
             self.context = context
+            self.llm_provider = llm_provider
+            self.config = kwargs.get("config", {})
 
     class FakeIndexValidator:
         def __init__(self, db_path, db):
@@ -228,6 +256,9 @@ async def test_complete_initialization_wires_graph_db_and_engine_config(
                     "max_topics_per_memory": 4,
                     "max_participants_per_memory": 5,
                     "max_facts_per_memory": 6,
+                    "atom_enabled": False,
+                    "atom_maintenance_interval_hours": 12.0,
+                    "atom_forget_delay_days": 3.0,
                 },
             }
         ),
@@ -253,3 +284,146 @@ async def test_complete_initialization_wires_graph_db_and_engine_config(
     assert init.memory_engine.config["graph_max_topics"] == 4
     assert init.memory_engine.config["graph_max_participants"] == 5
     assert init.memory_engine.config["graph_max_facts"] == 6
+    assert init.memory_engine.config["atom_enabled"] is False
+    assert init.memory_engine.config["atom_maintenance_interval_hours"] == 12.0
+    assert init.memory_engine.config["atom_forget_delay_days"] == 3.0
+    assert init.memory_processor.config.get("atom_enabled") is False
+
+
+@pytest.mark.asyncio
+async def test_complete_initialization_skips_graph_db_when_disabled(
+    monkeypatch, mock_context, tmp_path
+):
+    created_vec_dbs = []
+
+    class DummyEmbeddingProvider:
+        pass
+
+    class DummyProvider:
+        pass
+
+    class FakeFaissVecDB:
+        def __init__(self, db_path, index_path, embedding_provider):
+            self.db_path = db_path
+            self.index_path = index_path
+            self.embedding_provider = embedding_provider
+            created_vec_dbs.append(self)
+
+        async def initialize(self):
+            return None
+
+    class FakeDBMigration:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+    class FakeMemoryEngine:
+        def __init__(
+            self, db_path, faiss_db, graph_vector_db, llm_provider=None, config=None
+        ):
+            self.db_path = db_path
+            self.faiss_db = faiss_db
+            self.graph_vector_db = graph_vector_db
+            self.llm_provider = llm_provider
+            self.config = config or {}
+            self.text_processor = Mock(async_init=AsyncMock())
+
+        async def initialize(self):
+            return None
+
+    class FakeConversationStore:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        async def initialize(self):
+            return None
+
+        async def sync_message_counts(self):
+            return []
+
+    class FakeConversationManager:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeMemoryProcessor:
+        def __init__(self, context=None, llm_provider=None, **kwargs):
+            self.context = context
+            self.llm_provider = llm_provider
+
+    class FakeIndexValidator:
+        def __init__(self, db_path, db):
+            self.db_path = db_path
+            self.db = db
+
+    class FakeDecayScheduler:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def start(self):
+            return None
+
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.EmbeddingProvider",
+        DummyEmbeddingProvider,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.Provider",
+        DummyProvider,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.FaissVecDB",
+        FakeFaissVecDB,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.DBMigration",
+        FakeDBMigration,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.MemoryEngine",
+        FakeMemoryEngine,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.ConversationStore",
+        FakeConversationStore,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.ConversationManager",
+        FakeConversationManager,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.MemoryProcessor",
+        FakeMemoryProcessor,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.IndexValidator",
+        FakeIndexValidator,
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_livingmemory.core.plugin_initializer.DecayScheduler",
+        FakeDecayScheduler,
+    )
+
+    init = PluginInitializer(
+        mock_context,
+        ConfigManager(
+            {
+                "migration_settings": {"auto_migrate": False},
+                "importance_decay": {"decay_rate": 0},
+                "forgetting_agent": {"auto_cleanup_enabled": False},
+                "graph_memory": {"enabled": False},
+            }
+        ),
+        str(tmp_path),
+    )
+    init.embedding_provider = DummyEmbeddingProvider()
+    init.llm_provider = DummyProvider()
+    init._check_and_fix_dimension_mismatch = AsyncMock()
+    init._repair_message_counts = AsyncMock()
+    init._auto_rebuild_index_if_needed = AsyncMock()
+
+    await init._complete_initialization()
+
+    assert len(created_vec_dbs) == 1
+    assert init.graph_db is None
+    assert init.memory_engine.graph_vector_db is None
+    assert init.memory_engine.config["graph_memory_enabled"] is False
+    init._check_and_fix_dimension_mismatch.assert_awaited_once()

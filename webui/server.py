@@ -57,10 +57,30 @@ import aiosqlite
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from astrbot.api import logger
+
+
+class _FrameAllowMiddleware(BaseHTTPMiddleware):
+    """允许 WebUI 页面被嵌入到 AstrBot Plugin Pages 的 iframe 中"""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # 移除可能阻止 iframe 嵌入的响应头
+        response.headers.pop("X-Frame-Options", None)
+        # CSP: 允许被任何来源嵌入为 iframe
+        existing_csp = response.headers.get("Content-Security-Policy", "")
+        if "frame-ancestors" not in existing_csp:
+            if existing_csp:
+                response.headers["Content-Security-Policy"] = (
+                    existing_csp.rstrip(";") + "; frame-ancestors *"
+                )
+            else:
+                response.headers["Content-Security-Policy"] = "frame-ancestors *"
+        return response
 
 
 class WebUIServer:
@@ -465,18 +485,23 @@ class WebUIServer:
         if not index_path.exists():
             logger.warning("未找到 WebUI 前端文件，静态资源目录为空")
 
-        # CORS配置
+        # CORS配置 — 放宽来源以支持 AstrBot Plugin Pages 中跨域调用
         self._app.add_middleware(
             CORSMiddleware,
             allow_origins=[
                 f"http://{self.host}:{self.port}",
                 "http://localhost",
                 "http://127.0.0.1",
+                "http://localhost:6185",   # AstrBot WebUI 默认端口
+                "http://127.0.0.1:6185",
             ],
             allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["Content-Type", "Authorization", "X-Auth-Token"],
             allow_credentials=True,
         )
+
+        # 允许 WebUI 被嵌入到 AstrBot Plugin Pages 的 iframe 中
+        self._app.add_middleware(_FrameAllowMiddleware)
 
         # 静态文件
         if static_dir.exists():

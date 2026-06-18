@@ -5,8 +5,11 @@
 
 import re
 import string
+import warnings
 from collections import Counter
 from pathlib import Path
+
+from ..models.default_stopwords import DEFAULT_STOPWORDS as FALLBACK_STOPWORDS
 
 try:
     import jieba
@@ -14,6 +17,7 @@ try:
     JIEBA_AVAILABLE = True
 except ImportError:
     JIEBA_AVAILABLE = False
+JIEBA_RUNTIME_DISABLED = False
 
 
 class TextProcessor:
@@ -27,258 +31,8 @@ class TextProcessor:
     3. BM25 算法的词频统计
     """
 
-    # 内置的基础停用词表（后备方案）
-    DEFAULT_STOPWORDS = {
-        # 代词
-        "我",
-        "你",
-        "他",
-        "她",
-        "它",
-        "我们",
-        "你们",
-        "他们",
-        "她们",
-        "它们",
-        "自己",
-        "自家",
-        "咱",
-        "咱们",
-        "这",
-        "那",
-        "这个",
-        "那个",
-        "这些",
-        "那些",
-        "哪",
-        "哪个",
-        "哪些",
-        "谁",
-        "什么",
-        "怎么",
-        "怎样",
-        "多少",
-        # 助词
-        "的",
-        "了",
-        "着",
-        "过",
-        "地",
-        "得",
-        "呢",
-        "吗",
-        "吧",
-        "啊",
-        "呀",
-        "哇",
-        "哦",
-        "嗯",
-        "啦",
-        "嘛",
-        "呗",
-        # 连词
-        "和",
-        "与",
-        "及",
-        "以及",
-        "或",
-        "或者",
-        "还是",
-        "而",
-        "且",
-        "并",
-        "但",
-        "但是",
-        "然而",
-        "可是",
-        "不过",
-        "而且",
-        "并且",
-        "因此",
-        "所以",
-        "因为",
-        "由于",
-        "如果",
-        "假如",
-        "虽然",
-        "尽管",
-        "除非",
-        # 介词
-        "在",
-        "从",
-        "向",
-        "往",
-        "到",
-        "由",
-        "为",
-        "对",
-        "关于",
-        "按照",
-        "根据",
-        "通过",
-        "经过",
-        "沿着",
-        "朝",
-        "朝着",
-        "沿",
-        "用",
-        "以",
-        "按",
-        "依",
-        "凭",
-        "靠",
-        "当",
-        "于",
-        "比",
-        # 副词
-        "很",
-        "太",
-        "非常",
-        "极",
-        "十分",
-        "最",
-        "更",
-        "挺",
-        "特别",
-        "尤其",
-        "都",
-        "也",
-        "还",
-        "再",
-        "又",
-        "就",
-        "才",
-        "已",
-        "曾",
-        "已经",
-        "正在",
-        "将",
-        "将要",
-        "总是",
-        "一直",
-        "从来",
-        "刚",
-        "刚才",
-        "马上",
-        "立刻",
-        "顿时",
-        "忽然",
-        "突然",
-        "渐渐",
-        "逐渐",
-        "慢慢",
-        # 量词
-        "个",
-        "只",
-        "件",
-        "条",
-        "张",
-        "把",
-        "块",
-        "片",
-        "次",
-        "遍",
-        "些",
-        "点",
-        "下",
-        "回",
-        "趟",
-        "番",
-        "场",
-        "阵",
-        "样",
-        "种",
-        # 叹词
-        "哦",
-        "啊",
-        "呀",
-        "哎",
-        "唉",
-        "嗯",
-        "哼",
-        "嘿",
-        "哈",
-        # 动词（常用虚词性动词）
-        "是",
-        "有",
-        "为",
-        "在",
-        "到",
-        "去",
-        "来",
-        "成",
-        "做",
-        "看",
-        "说",
-        "让",
-        "给",
-        "被",
-        "把",
-        "能",
-        "会",
-        "要",
-        "想",
-        # 否定词
-        "不",
-        "没",
-        "没有",
-        "别",
-        "莫",
-        "勿",
-        "非",
-        "未",
-        "无",
-        # 疑问词
-        "吗",
-        "呢",
-        "吧",
-        "啊",
-        "么",
-        "呀",
-        # 其他虚词
-        "之",
-        "所",
-        "其",
-        "此",
-        "该",
-        "各",
-        "每",
-        "某",
-        "另",
-        "等",
-        "等等",
-        "如此",
-        "这样",
-        "那样",
-        "如何",
-        "怎样",
-        "多么",
-        # 常见无意义词
-        "一下",
-        "一点",
-        "一些",
-        "一切",
-        "一样",
-        "一般",
-        "一起",
-        "一边",
-        "上下",
-        "左右",
-        "前后",
-        "里外",
-        "东西",
-        "方面",
-        "时候",
-        "地方",
-        "样子",
-        "起来",
-        "出来",
-        "进去",
-        "过去",
-        "过来",
-        "下去",
-        "上来",
-    }
+    # Built-in fallback stopwords shared with StopwordsManager.
+    DEFAULT_STOPWORDS = FALLBACK_STOPWORDS
 
     def __init__(self, stopwords_dir: str | None = None):
         """
@@ -294,15 +48,13 @@ class TextProcessor:
 
         # 检查 jieba 是否可用
         if not JIEBA_AVAILABLE:
-            import warnings
-
             warnings.warn(
                 "jieba 库未安装,中文分词将受限。建议安装: pip install jieba",
                 UserWarning,
             )
 
         # 使用默认停用词(StopwordsManager 将在需要时异步加载)
-        self.stopwords = self.DEFAULT_STOPWORDS.copy()
+        self.stopwords = set(self.DEFAULT_STOPWORDS)
 
     async def async_init(self) -> None:
         """
@@ -314,9 +66,9 @@ class TextProcessor:
             from ..utils.stopwords_manager import StopwordsManager
 
             manager = StopwordsManager(self.stopwords_dir)
-            stopwords_path = await manager.get_stopwords()
-            if stopwords_path:
-                await self.load_stopwords(stopwords_path)
+            stopwords = await manager.load_stopwords()
+            if stopwords:
+                self.stopwords.update(stopwords)
 
     def tokenize(self, text: str, remove_stopwords: bool = True) -> list[str]:
         """
@@ -394,6 +146,14 @@ class TextProcessor:
         """
         return [self.tokenize(text, remove_stopwords) for text in texts]
 
+    async def tokenize_async(
+        self, text: str, remove_stopwords: bool = True
+    ) -> list[str]:
+        """异步分词：将 CPU 密集型 jieba 分词卸载到线程池，避免阻塞事件循环。"""
+        import asyncio
+
+        return await asyncio.to_thread(self.tokenize, text, remove_stopwords)
+
     async def load_stopwords(self, stopwords_path: str) -> set[str]:
         """
         加载停用词表
@@ -445,15 +205,28 @@ class TextProcessor:
             >>> processor.add_custom_words(["LivingMemory", "AstrBot"])
         """
         if not JIEBA_AVAILABLE:
-            import warnings
-
             warnings.warn("jieba 未安装,无法添加自定义词汇", UserWarning)
             return
 
-        self.custom_words.update(words)
+        clean_words = [word for word in words if isinstance(word, str) and word.strip()]
+        failed_words = []
+        for word in clean_words:
+            try:
+                jieba.add_word(word)
+            except Exception as e:
+                failed_words.append(word)
+                warnings.warn(
+                    f"jieba 添加自定义词失败，已跳过词语 {word!r}: {e}",
+                    UserWarning,
+                )
+                continue
+            self.custom_words.add(word)
 
-        for word in words:
-            jieba.add_word(word)
+        if failed_words:
+            warnings.warn(
+                f"已跳过 {len(failed_words)} 个无法添加到 jieba 的自定义词",
+                UserWarning,
+            )
 
     def add_stopwords(self, words: list[str]):
         """
@@ -565,13 +338,49 @@ class TextProcessor:
         # 检查是否包含中文
         has_chinese = any("\u4e00" <= char <= "\u9fff" for char in text)
 
-        if has_chinese and JIEBA_AVAILABLE:
+        if has_chinese and JIEBA_AVAILABLE and not JIEBA_RUNTIME_DISABLED:
             # 使用 jieba 分词 (搜索模式,适合检索)
-            tokens = list(jieba.cut_for_search(text))
+            try:
+                tokens = list(jieba.cut_for_search(text))
+            except Exception as e:
+                warnings.warn(
+                    f"jieba 分词初始化失败，已降级为内置中文分词: {e}",
+                    UserWarning,
+                )
+                self._disable_jieba_runtime()
+                tokens = self._fallback_segment(text)
         else:
             # 按空格分词 (适用于英文或 jieba 不可用时)
-            tokens = text.split()
+            tokens = self._fallback_segment(text)
 
+        return tokens
+
+    @staticmethod
+    def _disable_jieba_runtime() -> None:
+        global JIEBA_RUNTIME_DISABLED
+        JIEBA_RUNTIME_DISABLED = True
+
+    @staticmethod
+    def _fallback_segment(text: str) -> list[str]:
+        tokens: list[str] = []
+        buffer: list[str] = []
+
+        def flush_buffer():
+            if buffer:
+                tokens.append("".join(buffer))
+                buffer.clear()
+
+        for char in text:
+            if "\u4e00" <= char <= "\u9fff":
+                flush_buffer()
+                tokens.append(char)
+                continue
+            if char.isspace():
+                flush_buffer()
+                continue
+            buffer.append(char)
+
+        flush_buffer()
         return tokens
 
     def is_stopword(self, word: str) -> bool:

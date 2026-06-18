@@ -31,22 +31,54 @@ class SessionManagerConfig(BaseModel):
         le=10000,
         description="单会话最大消息数量(超出后自动删除旧消息)",
     )
+    cleanup_batch_size: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="历史消息超过上限后每次批量删除的旧已总结消息数",
+    )
 
 
 class RecallEngineConfig(BaseModel):
     """回忆引擎配置"""
 
-    top_k: int = Field(default=5, ge=1, le=50, description="返回记忆数量")
+    top_k: int = Field(
+        default=5, ge=0, le=50, description="返回记忆数量。设为 0 则跳过自动召回和注入"
+    )
+    max_k: int = Field(
+        default=10, ge=1, le=50, description="Agent 主动检索时允许的最大返回数量"
+    )
     importance_weight: float = Field(
         default=1.0, ge=0.0, le=10.0, description="重要性权重"
     )
     fallback_to_vector: bool = Field(default=True, description="是否启用向量检索回退")
     injection_method: str = Field(
-        default="user_message_before",
-        description="记忆注入方式: system_prompt(系统提示), user_message_before(用户消息前), user_message_after(用户消息后)",
+        default="extra_user_content",
+        description=(
+            "记忆注入方式: "
+            "extra_user_content(推荐，临时消息追加到用户消息末尾，不影响前缀缓存且不污染对话历史), "
+            "user_message_before(用户消息前), "
+            "user_message_after(用户消息后), "
+            "fake_tool_call(伪造工具调用), "
+            "fake_tool_call_deepseek_v4(DeepSeek V4兼容伪工具转录), "
+            "system_prompt(已废弃，自动回退至extra_user_content)"
+        ),
     )
     auto_remove_injected: bool = Field(
         default=True, description="是否自动删除对话历史中已注入的记忆片段"
+    )
+    inject_with_recent_context: bool = Field(
+        default=False,
+        description="启用后使用最近2轮对话作为扩展查询关键词，提升检索精准度",
+    )
+    search_cache_enabled: bool = Field(
+        default=True, description="是否启用短期检索结果缓存"
+    )
+    search_cache_ttl_seconds: float = Field(
+        default=45.0, ge=0.0, le=600.0, description="检索缓存 TTL 秒数"
+    )
+    search_cache_max_size: int = Field(
+        default=256, ge=0, le=10000, description="检索缓存最大条目数"
     )
 
 
@@ -62,45 +94,16 @@ class ReflectionEngineConfig(BaseModel):
     summary_trigger_rounds: int = Field(
         default=10, ge=1, le=100, description="触发反思的对话轮次"
     )
-    save_original_conversation: bool = Field(
-        default=False, description="保存记忆时是否包含原始对话历史"
+
+
+class AgentToolsConfig(BaseModel):
+    """Agent 工具配置"""
+
+    enable_recall_tool: bool = Field(
+        default=True, description="是否启用 Agent 主动回忆工具"
     )
-
-
-class SparseRetrieverConfig(BaseModel):
-    """稀疏检索器配置"""
-
-    enabled: bool = Field(default=True, description="是否启用稀疏检索")
-    bm25_k1: float = Field(default=1.2, ge=0.1, le=10.0, description="BM25 k1参数")
-    bm25_b: float = Field(default=0.75, ge=0.0, le=1.0, description="BM25 b参数")
-    use_chinese_tokenizer: bool = Field(default=True, description="是否使用jieba分词")
-    enable_stopwords_filtering: bool = Field(
-        default=True, description="是否启用停用词过滤"
-    )
-    stopwords_source: str = Field(default="hit", description="停用词来源")
-    custom_stopwords: str | list[str] = Field(default="", description="自定义停用词")
-
-    @model_validator(mode="after")
-    def process_custom_stopwords(self):
-        """处理自定义停用词字符串"""
-        if isinstance(self.custom_stopwords, str):
-            if self.custom_stopwords.strip():
-                # 逗号或空格分隔
-                self.custom_stopwords = [
-                    w.strip()
-                    for w in self.custom_stopwords.replace(",", " ").split()
-                    if w.strip()
-                ]
-            else:
-                self.custom_stopwords = []
-        return self
-
-
-class DenseRetrieverConfig(BaseModel):
-    """稠密检索器配置"""
-
-    enable_query_preprocessing: bool = Field(
-        default=True, description="是否启用查询预处理"
+    enable_memorize_tool: bool = Field(
+        default=False, description="是否启用 Agent 主动记忆写入工具"
     )
 
 
@@ -138,6 +141,15 @@ class ImportanceDecayConfig(BaseModel):
     """重要性衰减配置"""
 
     decay_rate: float = Field(default=0.01, ge=0.0, le=1.0, description="每日衰减率")
+    access_decay_window_days: float = Field(
+        default=30.0, ge=1.0, le=3650.0, description="访问频次强化的有效窗口天数"
+    )
+    access_decay_max_count: int = Field(
+        default=10, ge=1, le=10000, description="抵消衰减所需的访问次数上限"
+    )
+    access_count_decay_multiplier: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="每日衰减后访问次数保留比例"
+    )
 
 
 class MigrationSettings(BaseModel):
@@ -147,22 +159,87 @@ class MigrationSettings(BaseModel):
     create_backup: bool = Field(default=True, description="迁移前是否创建备份")
 
 
-class WebUISettings(BaseModel):
-    """WebUI 设置"""
+class IndexRebuildSettings(BaseModel):
+    """索引重建设置"""
 
-    enabled: bool = Field(default=False, description="是否启用 WebUI 控制台")
-    host: str = Field(default="127.0.0.1", description="WebUI 监听地址")
-    port: int = Field(default=8080, ge=1, le=65535, description="WebUI 监听端口")
-    access_password: str = Field(default="", description="WebUI 入口密码")
-    session_timeout: int = Field(
-        default=3600, ge=60, le=86400, description="WebUI 会话有效期（秒）"
+    batch_size: int = Field(default=50, ge=1, le=500, description="重建读取批量")
+    embedding_batch_size: int = Field(
+        default=8, ge=1, le=256, description="Embedding 请求批量"
+    )
+    tasks_limit: int = Field(default=1, ge=1, le=8, description="Embedding 并发上限")
+    max_retries: int = Field(default=5, ge=1, le=8, description="批次最大重试次数")
+    retry_base_delay: float = Field(
+        default=30.0, ge=0.0, le=60.0, description="重试基础等待秒数"
+    )
+    batch_delay: float = Field(
+        default=5.0, ge=0.0, le=10.0, description="读取批次间隔秒数"
+    )
+    request_delay: float = Field(
+        default=5.0, ge=0.0, le=60.0, description="Embedding 请求间隔秒数"
+    )
+    max_failure_ratio: float = Field(
+        default=0.02, ge=0.0, le=1.0, description="允许切换的最大失败比例"
+    )
+
+
+class GraphMemoryConfig(BaseModel):
+    """Graph-memory retrieval configuration."""
+
+    enabled: bool = Field(default=True, description="是否启用图记忆双路检索")
+    document_route_weight: float = Field(
+        default=0.65, ge=0.0, le=1.0, description="文档路权重"
+    )
+    graph_route_weight: float = Field(
+        default=0.35, ge=0.0, le=1.0, description="图路权重"
+    )
+    cross_route_bonus: float = Field(
+        default=0.08, ge=0.0, le=0.5, description="双路同时命中的额外加分"
+    )
+    expansion_limit: int = Field(
+        default=24, ge=1, le=200, description="图邻居扩展候选上限"
+    )
+    expansion_hops: int = Field(
+        default=1, ge=1, le=2, description="图关键词检索邻居扩展跳数"
+    )
+    second_hop_weight: float = Field(
+        default=0.4, ge=0.0, le=1.0, description="二跳图扩展候选权重"
+    )
+    dynamic_route_weighting: bool = Field(
+        default=True, description="是否按查询意图动态调整文档路和图路权重"
+    )
+    max_topics_per_memory: int = Field(
+        default=6, ge=1, le=20, description="单条记忆最多索引主题数"
+    )
+    max_participants_per_memory: int = Field(
+        default=8, ge=1, le=30, description="单条记忆最多索引参与者数"
+    )
+    max_facts_per_memory: int = Field(
+        default=8, ge=1, le=30, description="单条记忆最多索引事实数"
+    )
+    # Atom-level memory configuration
+    atom_enabled: bool = Field(
+        default=True, description="是否启用记忆原子化（细化粒度+时间衰减）"
+    )
+    atom_maintenance_interval_hours: float = Field(
+        default=24.0, ge=1.0, le=168.0, description="原子生命周期维护间隔(小时)"
+    )
+    atom_forget_delay_days: float = Field(
+        default=7.0, ge=1.0, le=90.0, description="过期原子延迟遗忘天数"
+    )
+    atom_purge_delay_days: float = Field(
+        default=30.0, ge=1.0, le=365.0, description="遗忘原子物理清理延迟天数"
     )
 
     @model_validator(mode="after")
-    def validate_password(self):
-        """启用时必须设置密码"""
-        if self.enabled and not self.access_password:
-            logger.info("WebUI 未设置访问密码，将在运行时自动生成随机密码。")
+    def validate_route_weights(self):
+        """Normalize route weights to sum to 1.0 for numerically stable fusion."""
+        total = self.document_route_weight + self.graph_route_weight
+        if total <= 0:
+            self.document_route_weight = 0.65
+            self.graph_route_weight = 0.35
+        elif total != 1.0:
+            self.document_route_weight = self.document_route_weight / total
+            self.graph_route_weight = self.graph_route_weight / total
         return self
 
 
@@ -187,42 +264,6 @@ class ExternalAPIConfig(BaseModel):
         return self
 
 
-class GraphMemoryConfig(BaseModel):
-    """Graph-memory retrieval configuration."""
-
-    enabled: bool = Field(default=True, description="是否启用图记忆双路检索")
-    document_route_weight: float = Field(
-        default=0.65, ge=0.0, le=1.0, description="文档路权重"
-    )
-    graph_route_weight: float = Field(
-        default=0.35, ge=0.0, le=1.0, description="图路权重"
-    )
-    cross_route_bonus: float = Field(
-        default=0.08, ge=0.0, le=0.5, description="双路同时命中的额外加分"
-    )
-    expansion_limit: int = Field(
-        default=24, ge=1, le=200, description="图邻居扩展候选上限"
-    )
-    max_topics_per_memory: int = Field(
-        default=6, ge=1, le=20, description="单条记忆最多索引主题数"
-    )
-    max_participants_per_memory: int = Field(
-        default=8, ge=1, le=30, description="单条记忆最多索引参与者数"
-    )
-    max_facts_per_memory: int = Field(
-        default=8, ge=1, le=30, description="单条记忆最多索引事实数"
-    )
-
-    @model_validator(mode="after")
-    def validate_route_weights(self):
-        """Keep route weights numerically stable."""
-        total = self.document_route_weight + self.graph_route_weight
-        if total <= 0:
-            self.document_route_weight = 0.65
-            self.graph_route_weight = 0.35
-        return self
-
-
 class LivingMemoryConfig(BaseModel):
     """完整插件配置"""
 
@@ -231,17 +272,16 @@ class LivingMemoryConfig(BaseModel):
     reflection_engine: ReflectionEngineConfig = Field(
         default_factory=ReflectionEngineConfig
     )
-    sparse_retriever: SparseRetrieverConfig = Field(
-        default_factory=SparseRetrieverConfig
-    )
-    dense_retriever: DenseRetrieverConfig = Field(default_factory=DenseRetrieverConfig)
+    agent_tools: AgentToolsConfig = Field(default_factory=AgentToolsConfig)
     forgetting_agent: ForgettingAgentConfig = Field(
         default_factory=ForgettingAgentConfig
     )
     filtering_settings: FilteringConfig = Field(default_factory=FilteringConfig)
     provider_settings: ProviderConfig = Field(default_factory=ProviderConfig)
-    webui_settings: WebUISettings = Field(default_factory=WebUISettings)
     migration_settings: MigrationSettings = Field(default_factory=MigrationSettings)
+    index_rebuild_settings: IndexRebuildSettings = Field(
+        default_factory=IndexRebuildSettings
+    )
     graph_memory: GraphMemoryConfig = Field(default_factory=GraphMemoryConfig)
     fusion_strategy: FusionStrategyConfig = Field(
         default_factory=FusionStrategyConfig, description="结果融合策略配置"

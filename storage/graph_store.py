@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 
 from ..core.models.graph_models import GraphEdge, GraphEntry, GraphNode
+from ..core.utils.number_utils import safe_float
 
 
 class GraphStore:
     """Persist graph nodes, edges, and searchable entries."""
 
+    _SQLITE_BATCH_SIZE = 500
+
     def __init__(self, db_path: str):
         self.db_path = db_path
+
+    @asynccontextmanager
+    async def _connect(self):
+        """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
+        db = await aiosqlite.connect(self.db_path)
+        try:
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.execute("PRAGMA busy_timeout = 10000")
+            yield db
+        finally:
+            await db.close()
 
     @staticmethod
     def _now_iso() -> str:
@@ -39,7 +54,9 @@ class GraphStore:
 
     async def initialize(self) -> None:
         """Create tables used by the graph-memory layer."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.execute("PRAGMA busy_timeout = 10000")
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute(
                 """
@@ -108,12 +125,18 @@ class GraphStore:
             )
             await db.execute(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS graph_entries_fts
+                CREATE VIRTUAL TABLE IF NOT EXISTS livingmemory_graph_entries_fts
                 USING fts5(content, entry_id UNINDEXED, tokenize='unicode61')
                 """
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_nodes_canonical ON graph_nodes(canonical_value)"
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_semantic
+                ON graph_edges(source_node_id, target_node_id, relation_type)
+                """
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_edges_memory_id ON graph_edges(source_memory_id)"
@@ -122,112 +145,216 @@ class GraphStore:
                 "CREATE INDEX IF NOT EXISTS idx_graph_entries_memory_id ON graph_entries(source_memory_id)"
             )
             await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_graph_entries_scope_latest
+                ON graph_entries(session_id, persona_id, source_memory_id, id DESC)
+                """
+            )
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_entries_session_id ON graph_entries(session_id)"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_entries_persona_id ON graph_entries(persona_id)"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_graph_entry_nodes_node ON graph_entry_nodes(node_id)"
+            )
             await db.commit()
+
+    @staticmethod
+    def _chunked(items: list[int], size: int) -> list[list[int]]:
+        return [items[index : index + size] for index in range(0, len(items), size)]
 
     async def upsert_node(self, node: GraphNode) -> int:
         """Insert or update one graph node and return its identifier."""
         now = self._now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT id FROM graph_nodes WHERE node_key = ?",
-                (node.node_key,),
-            )
-            row = await cursor.fetchone()
-            if row:
-                await db.execute(
-                    """
-                    UPDATE graph_nodes
-                    SET node_value = ?, metadata = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (node.value, self._to_json(node.metadata), now, row[0]),
-                )
-                await db.commit()
-                return int(row[0])
-
-            cursor = await db.execute(
-                """
-                INSERT INTO graph_nodes(
-                    node_key, node_type, node_value, canonical_value,
-                    metadata, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    node.node_key,
-                    node.node_type,
-                    node.value,
-                    node.canonical_value,
-                    self._to_json(node.metadata),
-                    now,
-                    now,
-                ),
-            )
+        async with self._connect() as db:
+            node_id = await self._upsert_node(db, node, now)
             await db.commit()
-            return int(cursor.lastrowid)
+            return node_id
+
+    async def upsert_nodes(self, nodes: list[GraphNode]) -> dict[str, int]:
+        """Insert or update nodes in one transaction."""
+        if not nodes:
+            return {}
+
+        now = self._now_iso()
+        node_key_to_id: dict[str, int] = {}
+        async with self._connect() as db:
+            for node in nodes:
+                node_key_to_id[node.node_key] = await self._upsert_node(db, node, now)
+            await db.commit()
+        return node_key_to_id
+
+    async def _upsert_node(
+        self,
+        db: aiosqlite.Connection,
+        node: GraphNode,
+        now: str,
+    ) -> int:
+        cursor = await db.execute(
+            """
+            INSERT INTO graph_nodes(
+                node_key, node_type, node_value, canonical_value,
+                metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_key) DO UPDATE SET
+                node_value = excluded.node_value,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            """,
+            (
+                node.node_key,
+                node.node_type,
+                node.value,
+                node.canonical_value,
+                self._to_json(node.metadata),
+                now,
+                now,
+            ),
+        )
+        cursor = await db.execute(
+            "SELECT id FROM graph_nodes WHERE node_key = ?",
+            (node.node_key,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0])
 
     async def add_edge(
         self,
         edge: GraphEdge,
         node_key_to_id: dict[str, int],
     ) -> int:
-        """Insert or update one graph edge and return its identifier."""
+        """Insert or update one graph edge and return its identifier.
+
+        Uses semantic_edge_key for cross-memory merging:
+        when the same semantic edge already exists (from a different memory),
+        confidence is updated via EMA and weight accumulates evidence.
+        """
         source_node_id = node_key_to_id[edge.source_key]
         target_node_id = node_key_to_id[edge.target_key]
         now = self._now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT id FROM graph_edges WHERE edge_key = ?",
-                (edge.edge_key,),
+        async with self._connect() as db:
+            edge_id = await self._add_edge(
+                db,
+                edge,
+                source_node_id,
+                target_node_id,
+                now,
             )
-            row = await cursor.fetchone()
-            if row:
-                await db.execute(
-                    """
-                    UPDATE graph_edges
-                    SET weight = ?, confidence = ?, status = ?, metadata = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        edge.weight,
-                        edge.confidence,
-                        edge.status,
-                        self._to_json(edge.metadata),
-                        now,
-                        row[0],
-                    ),
-                )
-                await db.commit()
-                return int(row[0])
+            await db.commit()
+            return edge_id
 
-            cursor = await db.execute(
-                """
-                INSERT INTO graph_edges(
-                    edge_key, source_node_id, target_node_id, relation_type,
-                    source_memory_id, weight, confidence, status,
-                    metadata, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    edge.edge_key,
+    async def add_edges(
+        self,
+        edges: list[GraphEdge],
+        node_key_to_id: dict[str, int],
+    ) -> dict[str, int]:
+        """Insert or update edges in one transaction."""
+        if not edges:
+            return {}
+
+        now = self._now_iso()
+        edge_key_to_id: dict[str, int] = {}
+        async with self._connect() as db:
+            for edge in edges:
+                source_node_id = node_key_to_id.get(edge.source_key)
+                target_node_id = node_key_to_id.get(edge.target_key)
+                if source_node_id is None or target_node_id is None:
+                    continue
+                edge_key_to_id[edge.edge_key] = await self._add_edge(
+                    db,
+                    edge,
                     source_node_id,
                     target_node_id,
-                    edge.relation_type,
-                    edge.source_memory_id,
+                    now,
+                )
+            await db.commit()
+        return edge_key_to_id
+
+    async def _add_edge(
+        self,
+        db: aiosqlite.Connection,
+        edge: GraphEdge,
+        source_node_id: int,
+        target_node_id: int,
+        now: str,
+    ) -> int:
+        # Exact key match first (same memory, same edge)
+        cursor = await db.execute(
+            "SELECT id FROM graph_edges WHERE edge_key = ?",
+            (edge.edge_key,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            await db.execute(
+                """
+                UPDATE graph_edges
+                SET weight = ?, confidence = ?, status = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
                     edge.weight,
                     edge.confidence,
                     edge.status,
                     self._to_json(edge.metadata),
                     now,
-                    now,
+                    row[0],
                 ),
             )
-            await db.commit()
-            return int(cursor.lastrowid)
+            return int(row[0])
+
+        # Cross-memory semantic merge: find same relation between same nodes.
+        semantic_cursor = await db.execute(
+            """
+            SELECT id, confidence, weight FROM graph_edges
+            WHERE source_node_id = ? AND target_node_id = ?
+              AND relation_type = ?
+            ORDER BY id ASC LIMIT 1
+            """,
+            (source_node_id, target_node_id, edge.relation_type),
+        )
+        semantic_row = await semantic_cursor.fetchone()
+
+        if semantic_row:
+            existing_id = int(semantic_row[0])
+            old_conf = float(semantic_row[1] or 0.8)
+            old_weight = float(semantic_row[2] or 1.0)
+            merged_confidence = old_conf * 0.7 + edge.confidence * 0.3
+            merged_weight = old_weight + 0.15
+            await db.execute(
+                """
+                UPDATE graph_edges
+                SET confidence = ?, weight = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (merged_confidence, merged_weight, now, existing_id),
+            )
+            return existing_id
+
+        cursor = await db.execute(
+            """
+            INSERT INTO graph_edges(
+                edge_key, source_node_id, target_node_id, relation_type,
+                source_memory_id, weight, confidence, status,
+                metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                edge.edge_key,
+                source_node_id,
+                target_node_id,
+                edge.relation_type,
+                edge.source_memory_id,
+                edge.weight,
+                edge.confidence,
+                edge.status,
+                self._to_json(edge.metadata),
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
 
     async def add_entry(
         self,
@@ -237,95 +364,158 @@ class GraphStore:
     ) -> int:
         """Insert or update a searchable graph entry."""
         now = self._now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT id FROM graph_entries WHERE entry_key = ?",
-                (entry.entry_key,),
-            )
-            row = await cursor.fetchone()
-
-            if row:
-                entry_id = int(row[0])
-                await db.execute(
-                    """
-                    UPDATE graph_entries
-                    SET session_id = ?, persona_id = ?, entry_type = ?, relation_type = ?,
-                        content = ?, metadata = ?, edge_id = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        entry.session_id,
-                        entry.persona_id,
-                        entry.entry_type,
-                        entry.relation_type,
-                        entry.content,
-                        self._to_json(entry.metadata),
-                        edge_id,
-                        now,
-                        entry_id,
-                    ),
-                )
-                await db.execute(
-                    "DELETE FROM graph_entries_fts WHERE entry_id = ?", (entry_id,)
-                )
-                await db.execute(
-                    "DELETE FROM graph_entry_nodes WHERE entry_id = ?", (entry_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """
-                    INSERT INTO graph_entries(
-                        entry_key, source_memory_id, session_id, persona_id,
-                        entry_type, relation_type, content, metadata,
-                        edge_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        entry.entry_key,
-                        entry.source_memory_id,
-                        entry.session_id,
-                        entry.persona_id,
-                        entry.entry_type,
-                        entry.relation_type,
-                        entry.content,
-                        self._to_json(entry.metadata),
-                        edge_id,
-                        now,
-                        now,
-                    ),
-                )
-                entry_id = int(cursor.lastrowid)
-
-            await db.execute(
-                "INSERT INTO graph_entries_fts(entry_id, content) VALUES (?, ?)",
-                (entry_id, entry.content),
-            )
-            for node_key in entry.node_keys:
-                node_id = node_key_to_id.get(node_key)
-                if node_id is None:
-                    continue
-                await db.execute(
-                    "INSERT OR IGNORE INTO graph_entry_nodes(entry_id, node_id) VALUES (?, ?)",
-                    (entry_id, node_id),
-                )
+        async with self._connect() as db:
+            entry_id = await self._add_entry(db, entry, node_key_to_id, edge_id, now)
             await db.commit()
             return entry_id
+
+    async def add_entries(
+        self,
+        entries: list[GraphEntry],
+        node_key_to_id: dict[str, int],
+        edge_key_to_id: dict[str, int],
+    ) -> list[int]:
+        """Insert or update searchable graph entries in one transaction."""
+        if not entries:
+            return []
+
+        now = self._now_iso()
+        entry_ids: list[int] = []
+        async with self._connect() as db:
+            for entry in entries:
+                edge_id = None
+                if entry.relation_type and len(entry.node_keys) >= 2:
+                    edge_key = (
+                        f"{entry.node_keys[0]}|{entry.relation_type}|"
+                        f"{entry.node_keys[1]}|{entry.source_memory_id}"
+                    )
+                    edge_id = edge_key_to_id.get(edge_key)
+                entry_ids.append(
+                    await self._add_entry(db, entry, node_key_to_id, edge_id, now)
+                )
+            await db.commit()
+        return entry_ids
+
+    async def _add_entry(
+        self,
+        db: aiosqlite.Connection,
+        entry: GraphEntry,
+        node_key_to_id: dict[str, int],
+        edge_id: int | None,
+        now: str,
+    ) -> int:
+        cursor = await db.execute(
+            "SELECT id FROM graph_entries WHERE entry_key = ?",
+            (entry.entry_key,),
+        )
+        row = await cursor.fetchone()
+
+        if row:
+            entry_id = int(row[0])
+            await db.execute(
+                """
+                UPDATE graph_entries
+                SET session_id = ?, persona_id = ?, entry_type = ?, relation_type = ?,
+                    content = ?, metadata = ?, edge_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    entry.session_id,
+                    entry.persona_id,
+                    entry.entry_type,
+                    entry.relation_type,
+                    entry.content,
+                    self._to_json(entry.metadata),
+                    edge_id,
+                    now,
+                    entry_id,
+                ),
+            )
+            await db.execute(
+                "DELETE FROM livingmemory_graph_entries_fts WHERE entry_id = ?",
+                (entry_id,),
+            )
+            await db.execute(
+                "DELETE FROM graph_entry_nodes WHERE entry_id = ?",
+                (entry_id,),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                INSERT INTO graph_entries(
+                    entry_key, source_memory_id, session_id, persona_id,
+                    entry_type, relation_type, content, metadata,
+                    edge_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.entry_key,
+                    entry.source_memory_id,
+                    entry.session_id,
+                    entry.persona_id,
+                    entry.entry_type,
+                    entry.relation_type,
+                    entry.content,
+                    self._to_json(entry.metadata),
+                    edge_id,
+                    now,
+                    now,
+                ),
+            )
+            entry_id = int(cursor.lastrowid)
+
+        await db.execute(
+            "INSERT INTO livingmemory_graph_entries_fts(entry_id, content) VALUES (?, ?)",
+            (entry_id, entry.content),
+        )
+        entry_node_rows = [
+            (entry_id, node_id)
+            for node_id in (
+                node_key_to_id.get(node_key) for node_key in entry.node_keys
+            )
+            if node_id is not None
+        ]
+        if entry_node_rows:
+            await db.executemany(
+                "INSERT OR IGNORE INTO graph_entry_nodes(entry_id, node_id) VALUES (?, ?)",
+                entry_node_rows,
+            )
+        return entry_id
 
     async def update_entry_vector_doc_id(
         self, entry_id: int, vector_doc_id: int
     ) -> None:
         """Persist the vector-store identifier for one graph entry."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE graph_entries SET vector_doc_id = ?, updated_at = ? WHERE id = ?",
                 (vector_doc_id, self._now_iso(), entry_id),
             )
             await db.commit()
 
+    async def update_entry_vector_doc_ids(
+        self,
+        entry_vector_doc_ids: dict[int, int],
+    ) -> None:
+        """Persist vector-store identifiers for graph entries in one transaction."""
+        if not entry_vector_doc_ids:
+            return
+
+        now = self._now_iso()
+        async with self._connect() as db:
+            await db.executemany(
+                "UPDATE graph_entries SET vector_doc_id = ?, updated_at = ? WHERE id = ?",
+                [
+                    (vector_doc_id, now, entry_id)
+                    for entry_id, vector_doc_id in entry_vector_doc_ids.items()
+                ],
+            )
+            await db.commit()
+
     async def delete_memory(self, source_memory_id: int) -> list[int]:
         """Delete graph artifacts belonging to one source memory."""
         vector_doc_ids: list[int] = []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 "SELECT id, vector_doc_id FROM graph_entries WHERE source_memory_id = ?",
                 (source_memory_id,),
@@ -337,7 +527,7 @@ class GraphStore:
             if entry_ids:
                 placeholders = ",".join("?" * len(entry_ids))
                 await db.execute(
-                    f"DELETE FROM graph_entries_fts WHERE entry_id IN ({placeholders})",
+                    f"DELETE FROM livingmemory_graph_entries_fts WHERE entry_id IN ({placeholders})",
                     entry_ids,
                 )
                 await db.execute(
@@ -368,6 +558,76 @@ class GraphStore:
             await db.commit()
         return vector_doc_ids
 
+    async def batch_delete_memories(
+        self, source_memory_ids: list[int]
+    ) -> dict[int, list[int]]:
+        """Batch delete graph artifacts for multiple source memories."""
+        result: dict[int, list[int]] = {}
+        if not source_memory_ids:
+            return result
+
+        normalized_ids = sorted({int(item) for item in source_memory_ids})
+        async with self._connect() as db:
+            for batch in self._chunked(normalized_ids, self._SQLITE_BATCH_SIZE):
+                memory_placeholders = ",".join("?" * len(batch))
+
+                cursor = await db.execute(
+                    f"""
+                    SELECT id, source_memory_id, vector_doc_id
+                    FROM graph_entries
+                    WHERE source_memory_id IN ({memory_placeholders})
+                    """,
+                    batch,
+                )
+                rows = await cursor.fetchall()
+                entry_ids: list[int] = []
+                for row in rows:
+                    entry_id = int(row[0])
+                    memory_id = int(row[1])
+                    vector_doc_id = row[2]
+                    entry_ids.append(entry_id)
+                    if vector_doc_id is not None:
+                        result.setdefault(memory_id, []).append(int(vector_doc_id))
+
+                if entry_ids:
+                    for entry_batch in self._chunked(
+                        entry_ids,
+                        self._SQLITE_BATCH_SIZE,
+                    ):
+                        entry_placeholders = ",".join("?" * len(entry_batch))
+                        await db.execute(
+                            f"DELETE FROM livingmemory_graph_entries_fts WHERE entry_id IN ({entry_placeholders})",
+                            entry_batch,
+                        )
+                        await db.execute(
+                            f"DELETE FROM graph_entry_nodes WHERE entry_id IN ({entry_placeholders})",
+                            entry_batch,
+                        )
+                        await db.execute(
+                            f"DELETE FROM graph_entries WHERE id IN ({entry_placeholders})",
+                            entry_batch,
+                        )
+
+                await db.execute(
+                    f"DELETE FROM graph_edges WHERE source_memory_id IN ({memory_placeholders})",
+                    batch,
+                )
+
+            await db.execute(
+                """
+                DELETE FROM graph_nodes
+                WHERE id NOT IN (
+                    SELECT source_node_id FROM graph_edges
+                    UNION
+                    SELECT target_node_id FROM graph_edges
+                    UNION
+                    SELECT node_id FROM graph_entry_nodes
+                )
+                """
+            )
+            await db.commit()
+        return result
+
     async def search_entries_by_bm25(
         self,
         fts_query: str,
@@ -387,16 +647,16 @@ class GraphStore:
 
         where_clause = f"AND {' AND '.join(filters)}" if filters else ""
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"""
                 SELECT ge.id, ge.source_memory_id, ge.content, ge.metadata,
                        ge.entry_type, ge.relation_type, ge.session_id, ge.persona_id,
-                       bm25(graph_entries_fts) AS score
-                FROM graph_entries_fts
-                JOIN graph_entries ge ON ge.id = graph_entries_fts.entry_id
-                WHERE graph_entries_fts MATCH ? {where_clause}
+                       bm25(livingmemory_graph_entries_fts) AS score
+                FROM livingmemory_graph_entries_fts
+                JOIN graph_entries ge ON ge.id = livingmemory_graph_entries_fts.entry_id
+                WHERE livingmemory_graph_entries_fts MATCH ? {where_clause}
                 ORDER BY score ASC
                 LIMIT ?
                 """,
@@ -440,7 +700,7 @@ class GraphStore:
             return []
         clauses = ["canonical_value LIKE ?" for _ in tokens]
         params = [f"%{token}%" for token in tokens]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"""
@@ -489,7 +749,7 @@ class GraphStore:
             params.append(persona_id)
         where_clause = f"AND {' AND '.join(filters)}" if filters else ""
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"""
@@ -523,6 +783,45 @@ class GraphStore:
             )
         return hits
 
+    async def get_neighbor_node_ids(
+        self,
+        node_ids: list[int],
+        limit: int,
+    ) -> list[int]:
+        """Return graph nodes adjacent to the given nodes through active edges."""
+        if not node_ids:
+            return []
+
+        normalized_ids = sorted({int(item) for item in node_ids})
+        placeholders = ",".join("?" * len(normalized_ids))
+        limit = max(1, min(limit, 500))
+
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"""
+                SELECT neighbor_id, SUM(edge_weight) AS total_weight
+                FROM (
+                    SELECT target_node_id AS neighbor_id, weight AS edge_weight
+                    FROM graph_edges
+                    WHERE source_node_id IN ({placeholders})
+                      AND status = 'active'
+                    UNION ALL
+                    SELECT source_node_id AS neighbor_id, weight AS edge_weight
+                    FROM graph_edges
+                    WHERE target_node_id IN ({placeholders})
+                      AND status = 'active'
+                )
+                WHERE neighbor_id NOT IN ({placeholders})
+                GROUP BY neighbor_id
+                ORDER BY total_weight DESC, neighbor_id ASC
+                LIMIT ?
+                """,
+                (*normalized_ids, *normalized_ids, *normalized_ids, limit),
+            )
+            rows = await cursor.fetchall()
+
+        return [int(row[0]) for row in rows]
+
     async def get_recent_memory_ids(
         self,
         limit: int = 12,
@@ -543,7 +842,7 @@ class GraphStore:
 
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"""
@@ -589,7 +888,7 @@ class GraphStore:
 
         memory_placeholders = ",".join("?" * len(normalized_memory_ids))
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             entry_cursor = await db.execute(
                 f"""
@@ -704,7 +1003,7 @@ class GraphStore:
                     "summary": metadata.get("canonical_summary") or row["content"],
                     "session_id": metadata.get("session_id") or row["session_id"],
                     "persona_id": metadata.get("persona_id") or row["persona_id"],
-                    "importance": float(metadata.get("importance", 0.0) or 0.0),
+                    "importance": safe_float(metadata.get("importance"), 0.0),
                     "entry_count": 0,
                     "edge_count": 0,
                     "node_ids": set(),
@@ -757,11 +1056,12 @@ class GraphStore:
                 4,
             )
 
-        if len(node_map) > limit_nodes:
+        nodes_were_limited = len(node_map) > limit_nodes
+        if nodes_were_limited:
             ranked_nodes = sorted(
                 node_map.values(),
                 key=lambda item: (
-                    -float(item.get("weight", 0.0)),
+                    -safe_float(item.get("weight"), 0.0),
                     -int(item.get("entry_count", 0)),
                     -int(item.get("degree", 0)),
                     str(item.get("label", "")),
@@ -790,32 +1090,45 @@ class GraphStore:
                     filtered_entries.append(entry)
             entries = filtered_entries
 
-        filtered_memory_map: dict[int, dict[str, Any]] = {}
+        memory_view: dict[int, dict[str, Any]] = {}
         for memory_id, base in memory_base.items():
-            filtered_memory_map[memory_id] = {
+            memory_view[memory_id] = {
                 "memory_id": memory_id,
                 "summary": base["summary"],
                 "session_id": base["session_id"],
                 "persona_id": base["persona_id"],
                 "importance": base["importance"],
-                "entry_count": 0,
-                "edge_count": 0,
-                "node_ids": set(),
-                "entry_types": set(),
+                "entry_count": base["entry_count"],
+                "edge_count": base["edge_count"],
+                "node_ids": set(base["node_ids"]),
+                "entry_types": set(base["entry_types"]),
             }
 
-        for entry in entries:
-            memory = filtered_memory_map.get(entry["memory_id"])
-            if memory is None:
-                continue
-            memory["entry_count"] += 1
-            memory["node_ids"].update(entry["node_ids"])
-            memory["entry_types"].add(entry["entry_type"])
+        if not nodes_were_limited:
+            filtered_memory_map = memory_view
+        else:
+            filtered_memory_map = {
+                memory_id: {
+                    **base,
+                    "entry_count": 0,
+                    "edge_count": 0,
+                    "node_ids": set(),
+                    "entry_types": set(),
+                }
+                for memory_id, base in memory_view.items()
+            }
+            for entry in entries:
+                memory = filtered_memory_map.get(entry["memory_id"])
+                if memory is None:
+                    continue
+                memory["entry_count"] += 1
+                memory["node_ids"].update(entry["node_ids"])
+                memory["entry_types"].add(entry["entry_type"])
 
-        for edge in edges:
-            memory = filtered_memory_map.get(edge["memory_id"])
-            if memory is not None:
-                memory["edge_count"] += 1
+            for edge in edges:
+                memory = filtered_memory_map.get(edge["memory_id"])
+                if memory is not None:
+                    memory["edge_count"] += 1
 
         memories: list[dict[str, Any]] = []
         for memory in filtered_memory_map.values():
@@ -830,7 +1143,7 @@ class GraphStore:
         nodes = sorted(
             node_map.values(),
             key=lambda item: (
-                -float(item.get("weight", 0.0)),
+                -safe_float(item.get("weight"), 0.0),
                 -int(item.get("entry_count", 0)),
                 -int(item.get("degree", 0)),
                 str(item.get("label", "")),
@@ -841,7 +1154,7 @@ class GraphStore:
                 -int(item.get("entry_count", 0)),
                 -int(item.get("node_count", 0)),
                 -int(item.get("edge_count", 0)),
-                -float(item.get("importance", 0.0)),
+                -safe_float(item.get("importance"), 0.0),
             )
         )
 
@@ -876,7 +1189,7 @@ class GraphStore:
 
     async def get_memory_entry_stats(self) -> dict[str, int]:
         """Return graph storage counts for status reporting."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             node_cursor = await db.execute("SELECT COUNT(*) FROM graph_nodes")
             edge_cursor = await db.execute("SELECT COUNT(*) FROM graph_edges")
             entry_cursor = await db.execute("SELECT COUNT(*) FROM graph_entries")

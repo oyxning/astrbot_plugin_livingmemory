@@ -70,10 +70,16 @@ class DecayScheduler:
         if not self._state_file.exists():
             return {}
         try:
-            import aiofiles
-
-            async with aiofiles.open(self._state_file, encoding="utf-8") as f:
-                content = await f.read()
+            try:
+                import aiofiles
+            except ImportError:
+                content = await asyncio.to_thread(
+                    self._state_file.read_text,
+                    encoding="utf-8",
+                )
+            else:
+                async with aiofiles.open(self._state_file, encoding="utf-8") as f:
+                    content = await f.read()
             return json.loads(content)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[衰减调度] 加载状态文件失败: {e}")
@@ -82,11 +88,19 @@ class DecayScheduler:
     async def _save_state(self, state: dict) -> None:
         """保存状态文件"""
         try:
-            import aiofiles
-
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            async with aiofiles.open(self._state_file, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(state, ensure_ascii=False))
+            content = json.dumps(state, ensure_ascii=False)
+            try:
+                import aiofiles
+            except ImportError:
+                await asyncio.to_thread(
+                    self._state_file.write_text,
+                    content,
+                    encoding="utf-8",
+                )
+            else:
+                async with aiofiles.open(self._state_file, "w", encoding="utf-8") as f:
+                    await f.write(content)
         except OSError as e:
             logger.error(f"[衰减调度] 保存状态文件失败: {e}")
 
@@ -166,6 +180,23 @@ class DecayScheduler:
             if self.backup_enabled and self.db_migration:
                 await self._run_backup()
 
+            try:
+                maintenance_result = await self.memory_engine.maintain_storage()
+                if maintenance_result.get("success"):
+                    reclaimed = int(maintenance_result.get("bytes_reclaimed", 0))
+                    logger.info(
+                        f"[衰减调度] 存储维护完成，释放 {reclaimed / 1024 / 1024:.2f} MB"
+                    )
+                else:
+                    logger.warning(
+                        f"[衰减调度] 存储维护失败: {maintenance_result.get('error')}"
+                    )
+            except Exception as maintenance_err:
+                logger.warning(
+                    f"[衰减调度] 存储维护异常: {maintenance_err}",
+                    exc_info=True,
+                )
+
             return True
         except Exception as e:
             logger.error(f"[衰减调度] 执行衰减失败: {e}", exc_info=True)
@@ -207,8 +238,6 @@ class DecayScheduler:
         if not self.db_migration:
             return
         try:
-            from pathlib import Path
-
             db_path = Path(self.db_migration.db_path)
             backup_dir = db_path.parent / "backups"
             if not backup_dir.exists():

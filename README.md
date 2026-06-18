@@ -1,255 +1,200 @@
-# LivingMemory - 动态生命周期记忆插件
+<div align="center">
 
-**版本**: v2.1.9 | **作者**: lxfight | **许可证**: AGPLv3
+[中文](README_zh.md) | [English](README.md) | [Русский](README_ru.md)
 
----
+</div>
 
-## 核心特性
+# LivingMemory - Intelligent Long-Term Memory Plugin with Dynamic Lifecycle
 
-- **混合检索**: 结合 BM25 稀疏检索和 Faiss 向量检索，使用 RRF 融合算法
-- **双路四模式检索**: 同时维护文档路与图路，两边都支持关键词检索与向量检索，再统一融合排序
-- **智能总结**: 使用 LLM 自动总结对话历史，生成结构化记忆
-- **双通道总结**: `canonical_summary`（事实导向，用于检索）与 `persona_summary`（人格风格，用于注入）解耦存储
-- **会话隔离**: 支持按人格和会话隔离记忆
-- **自动遗忘**: 基于时间和重要性的智能清理机制
-- **数据安全**: 迁移前自动备份、索引重建带备份回滚、删除操作带事务保护
-- **WebUI 管理**: 可视化记忆管理界面
-- **外部 API**: 受 API Key 保护的 RESTful 接口，供第三方平台按 ID 获取记忆内容
+<p align="center">
+  <a href="https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/releases"><img src="https://img.shields.io/github/v/release/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory?color=76bad9" alt="Release"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+  <a href="https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/en/"><img src="https://img.shields.io/badge/docs-English%20%7C%20中文-3d7f8f" alt="Documentation"></a>
+  <a href="https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/stargazers"><img src="https://img.shields.io/github/stars/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory?style=social" alt="Stars"></a>
+  <a href="https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-red" alt="License AGPLv3"></a>
+</p>
 
----
-
-## 快速开始
-
-### 安装
-
-将插件文件夹放置于 AstrBot 的 `data/plugins` 目录下，AstrBot 将自动安装依赖。
-
-### 配置
-
-通过 AstrBot 控制台的插件配置页面进行配置：
-
-**必需配置**:
-- `embedding_provider_id`: 向量嵌入模型 ID（留空使用默认）
-- `llm_provider_id`: 大语言模型 ID（留空使用默认）
-
-**WebUI 配置**:
-```json
-{
-  "webui_settings": {
-    "enabled": true,
-    "host": "127.0.0.1",
-    "port": 8080,
-    "access_password": "your_password"
-  }
-}
-```
-
-**外部 API 配置**:
-```json
-{
-  "external_api": {
-    "enabled": true,
-    "host": "127.0.0.1",
-    "port": 8889,
-    "api_key": "your_secret_api_key"
-  }
-}
-```
+<p align="center">
+  <a href="https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/en/">English Documentation</a>
+  ·
+  <a href="https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/">中文文档</a>
+</p>
 
 ---
 
-## 命令
+## Core Features
 
-| 命令 | 说明 |
+- **Hybrid Retrieval**: Combines BM25 sparse retrieval and Faiss vector retrieval with RRF fusion.
+- **Dual-Route Four-Mode Retrieval**: Maintains both document and graph routes, each supporting keyword and vector retrieval before unified ranking.
+- **Intelligent Summarization**: Uses an LLM to summarize conversation history into structured memories.
+- **Dual-Channel Summarization**: Stores `canonical_summary` and `persona_summary` separately for retrieval and prompt injection.
+- **Session Isolation**: Supports persona-level and session-level memory isolation.
+- **Agent Memory Tools**: Exposes `recall_long_term_memory` and `memorize_long_term_memory` so agents can actively recall or write long-term memories when needed.
+- **Auto-Forgetting**: Cleans up stale memories based on time and importance.
+- **Memory Atomization**: Each key fact becomes an independent retrieval unit with its own TTL, decay curve, and lifecycle management.
+- **Time-Aware Graph**: Edge confidence updates dynamically via EMA as new evidence accumulates; cross-memory semantic edge merging; temporal decay in retrieval scoring.
+- **Data Safety**: Automatic backup on plugin version update, pre-migration backup, rollback on index rebuild failure, and transactional deletion.
+- **WebUI Management**: Supports the AstrBot official plugin Pages dashboard with trilingual (zh/en/ru) support and dark mode.
+
+---
+
+## Quick Start
+
+### Installation
+
+Place the plugin folder under AstrBot's `data/plugins` directory. AstrBot installs dependencies automatically.
+
+### Configuration
+
+Configure the plugin from the AstrBot plugin configuration page.
+
+**Required settings**:
+- `embedding_provider_id`: Embedding model ID. Leave empty to use the AstrBot default.
+- `llm_provider_id`: LLM model ID. Leave empty to use the AstrBot default.
+
+**Memory injection compatibility**:
+- `fake_tool_call` automatically falls back to `user_message_before` for Gemini providers to avoid tool-message protocol incompatibility.
+- For DeepSeek V4 `thinking` mode, select `fake_tool_call_deepseek_v4` manually if you need fake-tool-call semantics.
+
+### AstrBot Version Requirement
+
+- The **AstrBot official plugin Pages dashboard** requires **AstrBot >= 4.24.2**.
+
+### Management Entry
+
+1. Open the AstrBot official WebUI.
+2. Go to `Plugins -> LivingMemory -> Pages -> dashboard`.
+
+---
+
+## Commands
+
+| Command | Description |
 | :--- | :--- |
-| `/lmem status` | 查看记忆库状态 |
-| `/lmem search <query> [k]` | 搜索记忆（默认 5 条） |
-| `/lmem forget <id>` | 删除指定记忆 |
-| `/lmem rebuild-index` | 重建索引（修复索引不一致） |
-| `/lmem rebuild-graph` | 重建图记忆索引（为旧记忆回填图数据） |
-| `/lmem webui` | 查看 WebUI 信息 |
-| `/lmem reset` | 重置当前会话记忆上下文 |
-| `/lmem cleanup [preview\|exec]` | 清理历史消息中的记忆注入片段（默认 preview 预演） |
-| `/lmem help` | 显示帮助 |
+| `/lmem status` | View memory status |
+| `/lmem search <query> [k]` | Search memories (default 5 items) |
+| `/lmem forget <id>` | Delete a specific memory |
+| `/lmem rebuild-index` | Rebuild indexes |
+| `/lmem rebuild-graph` | Rebuild graph memory indexes |
+| `/lmem webui` | View WebUI information |
+| `/lmem summarize` | Trigger immediate summarization for the current session |
+| `/lmem reset` | Reset current session memory context |
+| `/lmem cleanup [preview\|exec]` | Clean injected memory fragments from history |
+| `/lmem help` | Show help |
 
 ---
 
-## 架构说明
+## Architecture
 
-### 模块结构
+### Module Structure
 
 ```
 astrbot_plugin_livingmemory/
-├── main.py                          # 插件注册和生命周期管理
+├── main.py                          # Plugin registration and lifecycle management
 ├── core/
-│   ├── base/                        # 基础组件（配置、常量、异常）
-│   ├── managers/                    # 核心管理器（MemoryEngine、ConversationManager）
-│   ├── retrieval/                   # 检索层（HybridRetriever、BM25、向量）
-│   ├── validators/                  # 验证器（IndexValidator）
-│   ├── plugin_initializer.py        # 插件初始化器
-│   ├── event_handler.py             # 事件处理器
-│   └── command_handler.py           # 命令处理器
-├── storage/                         # 存储层（DBMigration、ConversationStore）
-├── webui/                           # Web 管理界面
-├── external_api/                    # 外部 API 服务
-├── tests/                           # 测试套件
-└── docs/                            # 文档
+│   ├── base/                        # Base components
+│   ├── managers/                    # Core managers
+│   ├── retrieval/                   # Retrieval layer
+│   ├── validators/                  # Validators
+│   ├── plugin_initializer.py        # Plugin initializer
+│   ├── event_handler.py             # Event handler
+│   └── command_handler.py           # Command handler
+├── storage/                         # Storage layer
+├── pages/dashboard/                 # AstrBot official plugin Pages assets
+├── tests/                           # Test suite
+└── docs/                            # Documentation
 ```
 
-### 核心组件
+### Core Components
 
-1. **PluginInitializer**: 负责插件初始化
-   - 非阻塞初始化机制
-   - Provider等待和重试
-   - 自动数据库迁移
+1. **PluginInitializer**
+   - Non-blocking initialization
+   - Provider wait and retry
+   - Automatic database migration
 
-2. **EventHandler**: 处理事件钩子
-   - 群聊消息捕获
-   - 记忆召回
-   - 记忆反思
+2. **EventHandler**
+   - Group message capture
+   - Memory recall
+   - Memory reflection
 
-3. **CommandHandler**: 处理命令
-   - 统一命令响应格式
-   - 完善的错误处理
+3. **Agent Memory Tools**
+   - `recall_long_term_memory`: actively recalls long-term memories, reusing current session/persona filtering settings and returning raw memory results
+   - `memorize_long_term_memory`: actively writes long-term memories, always using the current UMO and persona while reusing the automatic summarization storage format
+   - Useful for scenarios such as “do you remember”, “what did I say before”, and “please remember ...”
 
-4. **ConfigManager**: 配置管理
-   - 集中配置加载
-   - 配置验证
-   - 嵌套键访问
+4. **CommandHandler**
+   - Unified command responses
+   - Structured error handling
 
-5. **ExternalAPIServer**: 外部 API 服务
-   - API Key 认证保护
-   - IP 级别频率限制（60s/30次）
-   - 按 ID 获取单条 / 批量获取 / 语义搜索
+5. **PluginPageApi**
+   - Registers plugin page APIs through `register_web_api`
+   - Reuses the runtime memory engine and graph components
+   - Provides memory management, recall debugging, and graph queries for `pages/dashboard`
+
+6. **ConfigManager**
+   - Centralized configuration loading
+   - Configuration validation
+   - Nested key access
 
 ---
 
-## 外部 API 参考
+## Agent Memory Tools
 
-启用 `external_api.enabled` 后，插件会在独立端口启动 RESTful API 服务，供第三方平台（如写书平台）调用获取记忆数据。所有数据接口均要求 API Key 认证。
+The plugin registers two LLM tools at runtime so agents can actively manage long-term memory:
 
-### 认证方式
-
-调用方必须在请求头中携带密钥（二选一）：
-
-```
-X-API-Key: <your_api_key>
-Authorization: Bearer <your_api_key>
-```
-
-未设置 `api_key` 时系统会自动生成 32 位随机密钥并输出到日志。
-
-### API 端点
-
-| 端点 | 方法 | 认证 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `/api/v1/health` | GET | 否 | 健康检查 |
-| `/api/v1/memories/{memory_id}` | GET | 是 | 按 ID 获取单条记忆 |
-| `/api/v1/memories/batch` | POST | 是 | 批量获取记忆 |
-| `/api/v1/memories/search` | POST | 是 | 语义搜索记忆 |
-
-### 调用示例
-
-**获取单条记忆：**
-```bash
-curl -H "X-API-Key: your_api_key" \
-  http://127.0.0.1:8889/api/v1/memories/42
-```
-
-**批量获取：**
-```bash
-curl -X POST \
-  -H "X-API-Key: your_api_key" \
-  -H "Content-Type: application/json" \
-  -d '{"memory_ids": [1, 2, 3, 42]}' \
-  http://127.0.0.1:8889/api/v1/memories/batch
-```
-
-返回示例：
-```json
-{
-  "success": true,
-  "data": {
-    "memories": {
-      "1": {"id": 1, "text": "用户偏好科幻小说...", "metadata": {...}},
-      "2": null
-    },
-    "requested_count": 2,
-    "found_count": 1
-  }
-}
-```
-
-**搜索记忆：**
-```bash
-curl -X POST \
-  -H "X-API-Key: your_api_key" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "角色设定", "k": 10}' \
-  http://127.0.0.1:8889/api/v1/memories/search
-```
-
-### 安全机制
-
-| 机制 | 说明 |
-| :--- | :--- |
-| API Key 认证 | 所有数据接口强制验证，密钥错误返回 403 |
-| 暴力破解防护 | 认证失败有 0.5s 延迟响应 |
-| IP 频率限制 | 每 IP 每 60 秒最多 30 次请求，超限返回 429 |
-| 批量查询上限 | 单次最多 100 条（可通过 `max_batch_size` 配置） |
+- `recall_long_term_memory`: actively recalls existing memories. Use it when the user asks what the bot remembers, asks about previous context, or when ambiguous references require checking history. Prefer short keywords such as topics, entities, preferences, or agreements.
+- `memorize_long_term_memory`: actively writes long-term memory. Use it when the user explicitly asks the bot to remember something, or when stable preferences, durable facts, agreements, identity details, or long-lived project context appear.
 
 ---
 
-## 开发者指南
+## Developer Guide
 
-### 测试
+### Testing
 
 ```bash
-# 运行所有测试
+# Run all tests
 pytest tests/
 
-# 运行特定测试
+# Run a specific test
 pytest tests/test_config_manager.py
 
-# 查看覆盖率
+# Show coverage
 pytest --cov=core tests/
 ```
 
+### Documentation
 
-### 文档
-
-- [API文档](docs/API.md): 详细的API参考
-- [架构文档](docs/ARCHITECTURE.md): 系统架构说明
-- [开发者指南](docs/DEVELOPMENT.md): 开发和贡献指南
+- [VitePress Documentation Site](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/en/): Quick start, features, WebUI usage, architecture, and docs deployment.
+- [中文文档](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/): Chinese documentation site.
 
 ---
 
-## 数据迁移（v1.4.0-1.4.2）
+## Data Migration (v1.4.0-v1.4.2)
 
-如果您从 v1.4.0-1.4.2 版本升级，旧数据可能无法自动迁移。手动恢复步骤：
+If you upgrade from v1.4.0-v1.4.2, old data may not migrate automatically. Manual recovery steps:
 
-1. 找到备份文件：`data/plugin_data/astrbot_plugin_livingmemory/backups/livingmemory_backup_<时间戳>.db`
-2. 将该文件移动到：`data/plugin_data/astrbot_plugin_livingmemory/`
-3. 重命名为：`livingmemory.db`
-4. 重载插件，系统会自动加载和处理数据
-
----
-
-## 更新记录
-
-详见 [CHANGELOG.md](CHANGELOG.md)
+1. Locate the backup file: `data/plugin_data/astrbot_plugin_livingmemory/backups/livingmemory_backup_<timestamp>.db`
+2. Move it to `data/plugin_data/astrbot_plugin_livingmemory/`
+3. Rename it to `livingmemory.db`
+4. Reload the plugin. The system will load and process the data automatically.
 
 ---
 
-## 支持
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## Support
 
 - **GitHub**: [astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)
-- **问题反馈**: [GitHub Issues](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues)
-- **QQ 群**: [![加入QQ群](https://img.shields.io/badge/QQ群-953245617-blue?style=flat-square&logo=tencent-qq)](https://qm.qq.com/cgi-bin/qm/qr?k=WdyqoP-AOEXqGAN08lOFfVSguF2EmBeO&jump_from=webapi&authKey=tPyfv90TVYSGVhbAhsAZCcSBotJuTTLf03wnn7/lQZPUkWfoQ/J8e9nkAipkOzwh)
-  （口令：lxfight）
+- **Issues**: [GitHub Issues](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues)
+- **QQ Group**: [![Join QQ Group](https://img.shields.io/badge/QQ%20Group-953245617-blue?style=flat-square&logo=tencent-qq)](https://qm.qq.com/cgi-bin/qm/qr?k=WdyqoP-AOEXqGAN08lOFfVSguF2EmBeO&jump_from=webapi&authKey=tPyfv90TVYSGVhbAhsAZCcSBotJuTTLf03wnn7/lQZPUkWfoQ/J8e9nkAipkOzwh)
+  (Password: lxfight)
 
 ---
 
-## 许可证
+## License
 
-本项目遵循 AGPLv3 许可证。
+This project is licensed under AGPLv3.

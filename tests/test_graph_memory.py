@@ -4,8 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-
+from astrbot_plugin_livingmemory.core.managers.graph_memory_manager import (
+    GraphMemoryManager,
+)
 from astrbot_plugin_livingmemory.core.managers.memory_engine import MemoryEngine
+from astrbot_plugin_livingmemory.core.models.graph_models import (
+    GraphEdge,
+    GraphEntry,
+    GraphNode,
+)
 from astrbot_plugin_livingmemory.core.processors.graph_extractor import GraphExtractor
 from astrbot_plugin_livingmemory.core.processors.text_processor import TextProcessor
 from astrbot_plugin_livingmemory.core.retrieval.graph_keyword_retriever import (
@@ -17,9 +24,6 @@ from astrbot_plugin_livingmemory.core.retrieval.graph_vector_retriever import (
 )
 from astrbot_plugin_livingmemory.core.retrieval.rrf_fusion import RRFFusion
 from astrbot_plugin_livingmemory.storage.graph_store import GraphStore
-from astrbot_plugin_livingmemory.core.managers.graph_memory_manager import (
-    GraphMemoryManager,
-)
 
 
 @dataclass
@@ -144,6 +148,51 @@ async def test_graph_memory_manager_indexes_nodes_edges_and_entries(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_graph_memory_manager_rejects_entry_id_mismatch(tmp_path: Path):
+    db_path = tmp_path / "graph_memory_mismatch.db"
+    graph_store = GraphStore(str(db_path))
+    await graph_store.initialize()
+
+    class MismatchedGraphStore:
+        async def upsert_nodes(self, nodes):
+            return await graph_store.upsert_nodes(nodes)
+
+        async def add_edges(self, edges, node_key_to_id):
+            return await graph_store.add_edges(edges, node_key_to_id)
+
+        async def add_entries(self, entries, node_key_to_id, edge_key_to_id):
+            entry_ids = await graph_store.add_entries(
+                entries,
+                node_key_to_id,
+                edge_key_to_id,
+            )
+            return entry_ids[:-1]
+
+        async def update_entry_vector_doc_ids(self, entry_vector_doc_ids):
+            return await graph_store.update_entry_vector_doc_ids(entry_vector_doc_ids)
+
+        async def delete_memory(self, source_memory_id):
+            return await graph_store.delete_memory(source_memory_id)
+
+    graph_manager = GraphMemoryManager(
+        graph_store=MismatchedGraphStore(),
+        graph_vector_retriever=GraphVectorRetriever(_FakeFaissDB()),
+        graph_extractor=GraphExtractor(),
+    )
+
+    with pytest.raises(RuntimeError, match="graph entry id count mismatch"):
+        await graph_manager.index_memory(
+            1,
+            "项目会议安排在明天下午三点",
+            {
+                "topics": ["项目会议"],
+                "participants": ["张三"],
+                "key_facts": ["明天下午三点开会"],
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_graph_store_snapshot_builds_ui_ready_subgraphs(tmp_path: Path):
     db_path = tmp_path / "graph_snapshot.db"
     graph_store = GraphStore(str(db_path))
@@ -246,6 +295,80 @@ async def test_graph_retriever_supports_keyword_and_vector_search(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_graph_keyword_retriever_supports_configurable_second_hop(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "graph_second_hop.db"
+    graph_store = GraphStore(str(db_path))
+    await graph_store.initialize()
+
+    nodes = [
+        GraphNode("person", "张三", "张三"),
+        GraphNode("topic", "项目", "项目"),
+        GraphNode("fact", "周五上线", "周五上线"),
+    ]
+    node_key_to_id = await graph_store.upsert_nodes(nodes)
+    edges = [
+        GraphEdge(
+            source_key="person:张三",
+            target_key="topic:项目",
+            relation_type="mentioned_in",
+            source_memory_id=1,
+        ),
+        GraphEdge(
+            source_key="topic:项目",
+            target_key="fact:周五上线",
+            relation_type="describes",
+            source_memory_id=2,
+        ),
+    ]
+    edge_key_to_id = await graph_store.add_edges(edges, node_key_to_id)
+    await graph_store.add_entries(
+        [
+            GraphEntry(
+                entry_key="entry-1",
+                source_memory_id=1,
+                session_id="s1",
+                persona_id="p1",
+                entry_type="participant",
+                content="Participant: 张三",
+                metadata={"importance": 0.5},
+                node_keys=["person:张三"],
+                relation_type="participant",
+            ),
+            GraphEntry(
+                entry_key="entry-2",
+                source_memory_id=2,
+                session_id="s1",
+                persona_id="p1",
+                entry_type="fact",
+                content="Fact: 周五上线",
+                metadata={"importance": 0.5},
+                node_keys=["fact:周五上线"],
+                relation_type="fact",
+            ),
+        ],
+        node_key_to_id,
+        edge_key_to_id,
+    )
+
+    retriever = GraphKeywordRetriever(
+        graph_store,
+        TextProcessor(),
+        config={
+            "graph_expansion_hops": 2,
+            "graph_expansion_limit": 12,
+            "graph_second_hop_weight": 0.4,
+        },
+    )
+
+    results = await retriever.search("张三", limit=5, session_id="s1", persona_id="p1")
+    assert {item.doc_id for item in results} >= {1, 2}
+    second_hop = next(item for item in results if item.doc_id == 2)
+    assert "graph_second_hop" in second_hop.metadata["graph_match_source"]
+
+
+@pytest.mark.asyncio
 async def test_memory_engine_dual_route_promotes_graph_hits(tmp_path: Path):
     doc_db_path = tmp_path / "memory.db"
     engine = MemoryEngine(
@@ -334,4 +457,41 @@ async def test_memory_engine_rebuild_graph_index(tmp_path: Path):
 
     stats = await engine.get_statistics()
     assert stats.get("graph_entries", 0) >= 1
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_store_batch_delete_memories(tmp_path: Path):
+    """GraphStore.batch_delete_memories 应一次删除多条 source_memory 的图数据。"""
+    doc_db_path = tmp_path / "graph_batch_del.db"
+    engine = MemoryEngine(
+        db_path=str(doc_db_path),
+        faiss_db=_FakeFaissDB(),
+        graph_vector_db=_FakeFaissDB(),
+        config={"fallback_enabled": True, "graph_memory_enabled": True},
+    )
+    await engine.initialize()
+
+    ids = []
+    for i in range(3):
+        mid = await engine.add_memory(
+            content=f"批量图删除测试{i}：讨论项目进度",
+            session_id="test:private:s1",
+            persona_id="persona_1",
+            importance=0.8,
+            metadata={
+                "topics": ["项目"],
+                "canonical_summary": f"批量图删除测试{i}",
+            },
+        )
+        ids.append(mid)
+
+    stats_before = await engine.graph_store.get_memory_entry_stats()
+
+    assert engine.graph_memory_manager is not None
+    await engine.graph_memory_manager.batch_delete_memories(ids)
+
+    stats_after = await engine.graph_store.get_memory_entry_stats()
+    assert stats_after["graph_entries"] < stats_before["graph_entries"]
+
     await engine.close()

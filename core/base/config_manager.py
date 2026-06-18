@@ -5,6 +5,8 @@
 
 from typing import Any
 
+from astrbot.api import logger
+
 from .config_validator import (
     get_default_config,
     merge_config_with_defaults,
@@ -37,6 +39,7 @@ class ConfigManager:
             self._config_obj = validate_config(merged_config)
             self._config = self._config_obj.model_dump()
         except Exception:
+            logger.warning("配置验证失败，已降级为默认配置", exc_info=True)
             # 配置验证失败，使用默认配置
             try:
                 self._config = get_default_config()
@@ -88,11 +91,6 @@ class ConfigManager:
     def provider_settings(self) -> dict[str, Any]:
         """Provider设置"""
         return self.get_section("provider_settings")
-
-    @property
-    def webui_settings(self) -> dict[str, Any]:
-        """WebUI设置"""
-        return self.get_section("webui_settings")
 
     @property
     def session_manager(self) -> dict[str, Any]:
